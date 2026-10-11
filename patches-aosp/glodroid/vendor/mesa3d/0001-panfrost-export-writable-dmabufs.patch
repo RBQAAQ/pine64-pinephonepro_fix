@@ -1,0 +1,21 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenCode <noreply@opencode.local>
+Date: Sun, 11 Oct 2026 22:30:00 +0800
+Subject: [PATCH] panfrost export writable dmabufs
+
+Built and verified on the PinePhone Pro. See docs/VERIFIED_REPAIRS.md
+for the exact validation scope and remaining limitations.
+
+---
+diff --git a/src/panfrost/lib/pan_bo.c b/src/panfrost/lib/pan_bo.c
+--- a/src/panfrost/lib/pan_bo.c
++++ b/src/panfrost/lib/pan_bo.c
+@@ -520,7 +520,7 @@ panfrost_bo_export(struct panfrost_bo *bo)
+ {
+         struct drm_prime_handle args = {
+                 .handle = bo->gem_handle,
+-                .flags = DRM_CLOEXEC,
++                .flags = DRM_CLOEXEC | DRM_RDWR,
+         };
+ 
+         int ret = drmIoctl(bo->dev->fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &args);

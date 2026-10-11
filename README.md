@@ -5,6 +5,13 @@
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Discord](https://img.shields.io/discord/753603904406683670.svg?label=Discord&logo=discord&colorB=7289DA&style=flat-square)](https://discord.gg/5H8cW5xA)
 
+## Verified repairs in this fork
+
+This fork includes compiled and real-device-tested PinePhone Pro repairs,
+including permanent cold-boot camera preview, maximum-resolution capture,
+autofocus, front/rear reopen and RX1-to-ISP1 routing. See
+[the validation scope and remaining limitations](docs/VERIFIED_REPAIRS.md).
+
 ## Warning!
 
 This project is a free and open-source initiative maintained by a group of volunteers. It is provided "as is" without any warranties or guarantees.
@@ -76,8 +83,8 @@ chmod a+x ~/bin/repo
 ### Fetching the sources and building the project
 
 ```bash
-git clone https://github.com/GloDroidCommunity/pine64-pinephonepro.git
-cd pine64-pinephonepro
+git clone https://github.com/RBQAAQ/pine64-pinephonepro_fix.git
+cd pine64-pinephonepro_fix
 ```
 
 ### Building AOSP

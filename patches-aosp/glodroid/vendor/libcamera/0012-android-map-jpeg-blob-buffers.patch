@@ -1,0 +1,85 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenCode <noreply@opencode.local>
+Date: Sun, 11 Oct 2026 22:30:00 +0800
+Subject: [PATCH] android map jpeg blob buffers
+
+Built and verified on the PinePhone Pro. See docs/VERIFIED_REPAIRS.md
+for the exact validation scope and remaining limitations.
+
+---
+diff --git a/src/android/mm/generic_camera_buffer.cpp b/src/android/mm/generic_camera_buffer.cpp
+index dd78d5f..0ae24ac 100644
+--- a/src/android/mm/generic_camera_buffer.cpp
++++ b/src/android/mm/generic_camera_buffer.cpp
+@@ -7,12 +7,14 @@
+ 
+ #include "../camera_buffer.h"
+ 
++#include <string.h>
+ #include <sys/mman.h>
+ #include <unistd.h>
+ 
+ #include "cros_gralloc_handle.h"
+ 
+ #include <libcamera/base/log.h>
++#include <libcamera/formats.h>
+ 
+ #include "libcamera/internal/formats.h"
+ #include "libcamera/internal/mapped_framebuffer.h"
+@@ -99,7 +101,29 @@ CameraBuffer::Private::Private([[maybe_unused]] CameraBuffer *cameraBuffer,
+ 		return;
+ 	}
+ 
++	LOG(HAL, Debug) << "Buffer layout: format=" << pixelFormat
++		       << " droid=" << cros_handle->droid_format
++		       << " planes=" << cros_handle->num_planes
++		       << " length=" << bufferLength_;
++
++	/* Android BLOB/JPEG storage is a linear byte buffer, not a YUV
++	 * plane layout. Some gralloc backends report zero image planes for
++	 * BLOB; map its actual backing FD instead of indexing an empty list. */
++	if (pixelFormat == formats::MJPEG ||
++	    cros_handle->droid_format == HAL_PIXEL_FORMAT_BLOB) {
++		if (bufferLength_ <= 0 || bufferLength_ > UINT32_MAX) {
++			error_ = -EINVAL;
++			return;
++		}
++		planeInfo_.push_back({ 0, 0, static_cast<unsigned int>(bufferLength_) });
++		return;
++	}
++
+ 	const unsigned int numPlanes = cros_handle->num_planes;
++	if (!numPlanes || numPlanes > DRV_MAX_PLANES) {
++		error_ = -EINVAL;
++		return;
++	}
+ 	planeInfo_.resize(numPlanes);
+ 
+ 	for (unsigned int i = 0; i < numPlanes; ++i) {
+@@ -114,6 +138,7 @@ CameraBuffer::Private::Private([[maybe_unused]] CameraBuffer *cameraBuffer,
+ 					<< " plane offset=" << planeInfo_[i].offset
+ 					<< ", plane size=" << planeInfo_[i].size
+ 					<< ", buffer length=" << bufferLength_;
++			error_ = -EINVAL;
+ 			return;
+ 		}
+ 
+@@ -131,6 +156,8 @@ unsigned int CameraBuffer::Private::numPlanes() const
+ 
+ Span<uint8_t> CameraBuffer::Private::plane(unsigned int plane)
+ {
++	if (plane >= planeInfo_.size())
++		return {};
+ 	if (!mapped_)
+ 		map();
+ 	if (!mapped_)
+@@ -178,7 +205,8 @@ void CameraBuffer::Private::map()
+ 	void *address = mmap(nullptr, bufferLength_, flags_, MAP_SHARED, fd_, 0);
+ 	if (address == MAP_FAILED) {
+ 		error_ = -errno;
+-		LOG(HAL, Error) << "Failed to mmap plane";
++		LOG(HAL, Error) << "Failed to mmap plane: " << strerror(-error_)
++			       << " fd=" << fd_ << " prot=" << flags_;
+ 		return;
+ 	}
+ 	maps_.emplace_back(static_cast<uint8_t *>(address), bufferLength_);

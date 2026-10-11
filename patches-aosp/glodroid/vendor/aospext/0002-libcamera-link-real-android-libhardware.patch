@@ -1,0 +1,23 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenCode <noreply@opencode.local>
+Date: Sun, 11 Oct 2026 22:30:00 +0800
+Subject: [PATCH] libcamera link real android libhardware
+
+Built and verified on the PinePhone Pro. See docs/VERIFIED_REPAIRS.md
+for the exact validation scope and remaining limitations.
+
+---
+diff --git a/meson_libcamera.mk b/meson_libcamera.mk
+--- a/meson_libcamera.mk
++++ b/meson_libcamera.mk
+@@ -13,8 +13,8 @@
+ 
+ include $(CLEAR_VARS)
+ 
+-LOCAL_SHARED_LIBRARIES := libc libexif libjpeg libdl libudev libevent libcrypto
+-MESON_GEN_PKGCONFIGS := libexif libjpeg dl libudev libevent_pthreads libcrypto
++LOCAL_SHARED_LIBRARIES := libc libexif libjpeg libdl libudev libevent libcrypto libhardware
++MESON_GEN_PKGCONFIGS := libexif libjpeg dl libudev libevent_pthreads libcrypto libhardware
+ 
+ MESON_BUILD_ARGUMENTS := \
+     -Dwerror=false                                                           \

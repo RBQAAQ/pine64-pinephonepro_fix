@@ -1,0 +1,1357 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenCode <noreply@opencode.local>
+Date: Sun, 11 Oct 2026 22:30:00 +0800
+Subject: [PATCH] libcamera: repair Android preview, autofocus and multistream reopen
+
+Built and verified on the PinePhone Pro. See docs/VERIFIED_REPAIRS.md
+for the exact validation scope and remaining limitations.
+
+---
+diff --git a/include/libcamera/ipa/rkisp1.mojom b/include/libcamera/ipa/rkisp1.mojom
+--- a/include/libcamera/ipa/rkisp1.mojom
++++ b/include/libcamera/ipa/rkisp1.mojom
+@@ -11,13 +11,15 @@
+ struct IPAConfigInfo {
+ 	libcamera.IPACameraSensorInfo sensorInfo;
+ 	libcamera.ControlInfoMap sensorControls;
++	libcamera.ControlInfoMap lensControls;
+ };
+ 
+ interface IPARkISP1Interface {
+ 	init(libcamera.IPASettings settings,
+ 	     uint32 hwRevision,
+ 	     libcamera.IPACameraSensorInfo sensorInfo,
+-	     libcamera.ControlInfoMap sensorControls)
++	     libcamera.ControlInfoMap sensorControls,
++	     libcamera.ControlInfoMap lensControls)
+ 		=> (int32 ret, libcamera.ControlInfoMap ipaControls);
+ 	start() => (int32 ret);
+ 	stop();
+@@ -38,5 +40,6 @@
+ interface IPARkISP1EventInterface {
+ 	paramsBufferReady(uint32 frame);
+ 	setSensorControls(uint32 frame, libcamera.ControlList sensorControls);
++	setLensControls(libcamera.ControlList lensControls);
+ 	metadataReady(uint32 frame, libcamera.ControlList metadata);
+ };
+diff --git a/src/libcamera/control_ids.yaml b/src/libcamera/control_ids.yaml
+--- a/src/libcamera/control_ids.yaml
++++ b/src/libcamera/control_ids.yaml
+@@ -943,4 +943,19 @@
+             value. All of the custom test patterns will be static (that is the
+             raw image must not vary from frame to frame).
+ 
++  - AfLensPositionUncalibrated:
++      type: float
++      draft: true
++      description: |
++        Fork-specific normalized actuator coordinate, not diopters.
++        Zero is farthest focus and one is nearest focus. Used only for
++        Android lenses explicitly marked UNCALIBRATED.
++
++  - AfLensMoving:
++      type: bool
++      draft: true
++      description: |
++        Fork-specific actuator settling state associated with autofocus
++        and uncalibrated manual lens movements.
++
+ ...
+diff --git a/src/libcamera/pipeline/rkisp1/rkisp1.cpp b/src/libcamera/pipeline/rkisp1/rkisp1.cpp
+--- a/src/libcamera/pipeline/rkisp1/rkisp1.cpp
++++ b/src/libcamera/pipeline/rkisp1/rkisp1.cpp
+@@ -32,6 +32,7 @@
+ #include <libcamera/ipa/rkisp1_ipa_proxy.h>
+ 
+ #include "libcamera/internal/camera.h"
++#include "libcamera/internal/camera_lens.h"
+ #include "libcamera/internal/camera_sensor.h"
+ #include "libcamera/internal/delayed_controls.h"
+ #include "libcamera/internal/device_enumerator.h"
+@@ -113,6 +114,7 @@
+ 	void paramFilled(unsigned int frame);
+ 	void setSensorControls(unsigned int frame,
+ 			       const ControlList &sensorControls);
++	void setLensControls(const ControlList &lensControls);
+ 
+ 	void metadataReady(unsigned int frame, const ControlList &metadata);
+ };
+@@ -339,6 +341,8 @@
+ 		return -ENOENT;
+ 
+ 	ipa_->setSensorControls.connect(this, &RkISP1CameraData::setSensorControls);
++	if (sensor_->focusLens())
++		ipa_->setLensControls.connect(this, &RkISP1CameraData::setLensControls);
+ 	ipa_->paramsBufferReady.connect(this, &RkISP1CameraData::paramFilled);
+ 	ipa_->metadataReady.connect(this, &RkISP1CameraData::metadataReady);
+ 
+@@ -367,8 +371,11 @@
+ 		return ret;
+ 	}
+ 
++	ControlInfoMap lensControls;
++	if (CameraLens *lens = sensor_->focusLens())
++		lensControls = lens->controls();
+ 	ret = ipa_->init({ ipaTuningFile, sensor_->model() }, hwRevision,
+-			 sensorInfo, sensor_->controls(), &controlInfo_);
++			 sensorInfo, sensor_->controls(), lensControls, &controlInfo_);
+ 	if (ret < 0) {
+ 		LOG(RkISP1, Error) << "IPA initialization failure";
+ 		return ret;
+@@ -412,6 +419,17 @@
+ 	info->metadataProcessed = true;
+ 
+ 	pipe()->tryCompleteRequest(info);
++}
++
++void RkISP1CameraData::setLensControls(const ControlList &lensControls)
++{
++	CameraLens *lens = sensor_->focusLens();
++	if (!lens)
++		return;
++	for (const auto &[id, value] : lensControls) {
++		if (id == V4L2_CID_FOCUS_ABSOLUTE && lens->setFocusPosition(value.get<int32_t>()))
++			LOG(RkISP1, Error) << "Failed to move camera lens";
++	}
+ }
+ 
+ /* -----------------------------------------------------------------------------
+@@ -811,6 +829,8 @@
+ 		return ret;
+ 
+ 	ipaConfig.sensorControls = data->sensor_->controls();
++	if (CameraLens *lens = data->sensor_->focusLens())
++		ipaConfig.lensControls = lens->controls();
+ 
+ 	ret = data->ipa_->configure(ipaConfig, streamConfig, &data->controlInfo_);
+ 	if (ret) {
+@@ -918,6 +938,11 @@
+ 	ret = allocateBuffers(camera);
+ 	if (ret)
+ 		return ret;
++
++	/* V4L2 frame sequences restart at zero for each streaming session.
++	 * Discard delayed controls from the previous session before IPA start
++	 * queues the new initial controls. */
++	data->delayedCtrls_->reset();
+ 
+ 	ret = data->ipa_->start();
+ 	if (ret) {
+diff --git a/src/android/camera_device.cpp b/src/android/camera_device.cpp
+--- a/src/android/camera_device.cpp
++++ b/src/android/camera_device.cpp
+@@ -250,6 +250,7 @@
+ 	: id_(id), state_(State::Stopped), camera_(std::move(camera)),
+ 	  facing_(CAMERA_FACING_FRONT), orientation_(0)
+ {
++	/* Temporary lifecycle diagnostics; remove after the reopen regression. */
+ 	camera_->requestCompleted.connect(this, &CameraDevice::requestComplete);
+ 
+ 	maker_ = "libcamera";
+@@ -275,7 +276,11 @@
+ 	}
+ }
+ 
+-CameraDevice::~CameraDevice() = default;
++CameraDevice::~CameraDevice()
++{
++	stop();
++	camera_->requestCompleted.disconnect(this);
++}
+ 
+ std::unique_ptr<CameraDevice> CameraDevice::create(unsigned int id,
+ 						   std::shared_ptr<Camera> cam)
+@@ -426,6 +431,8 @@
+ 
+ 	camera_->stop();
+ 
++	for (CameraStream &stream : streams_)
++		stream.flush();
+ 	MutexLocker stateLock(stateMutex_);
+ 	state_ = State::Stopped;
+ }
+@@ -433,14 +440,15 @@
+ void CameraDevice::stop()
+ {
+ 	MutexLocker stateLock(stateMutex_);
+-	if (state_ == State::Stopped)
+-		return;
+-
+-	camera_->stop();
++	if (state_ != State::Stopped)
++		camera_->stop();
++	for (CameraStream &stream : streams_)
++		stream.flush();
+ 
+ 	{
+ 		MutexLocker descriptorsLock(descriptorsMutex_);
+ 		descriptors_ = {};
++		activeRequests_.clear();
+ 	}
+ 
+ 	streams_.clear();
+@@ -636,7 +644,14 @@
+ 		}
+ 
+ 		Camera3StreamConfig streamConfig;
++#if defined(OS_CHROMEOS)
+ 		streamConfig.streams = { { stream, CameraStream::Type::Direct } };
++#else
++		/* Generic gralloc strides need not match the ISP's layout. Capture
++		 * into pipeline buffers and copy into the Android buffer layout. */
++		stream->usage |= GRALLOC_USAGE_SW_WRITE_OFTEN;
++		streamConfig.streams = { { stream, CameraStream::Type::Internal } };
++#endif
+ 		streamConfig.config.size = size;
+ 		streamConfig.config.pixelFormat = format;
+ 		streamConfigs.push_back(std::move(streamConfig));
+@@ -705,8 +720,41 @@
+ 		streamConfigs[index].streams.push_back({ jpegStream, type });
+ 	}
+ 
++#if !defined(OS_CHROMEOS)
++	/* Negotiate an aligned INTERNAL capture rectangle. RK3399 can leave
++	 * 64-byte chroma holes for unaligned NV12 image payloads; padding only
++	 * the backing allocation is insufficient. Android sizes stay unchanged
++	 * and software post-processing crops the small extra capture border. */
++	const Size sensorLimit = camera_->properties().get(properties::PixelArraySize).value_or(Size{});
++	for (auto &streamConfig : streamConfigs) {
++		auto &cfg = streamConfig.config;
++		if (cfg.pixelFormat != formats::NV12 ||
++		    (static_cast<uint64_t>(cfg.size.width) * cfg.size.height / 2) % 64 == 0)
++			continue;
++		Size best{};
++		uint64_t bestArea = UINT64_MAX;
++		for (unsigned int dy = 0; dy <= 32; dy += 2) {
++			for (unsigned int dx = 0; dx <= 64; dx += 2) {
++				Size candidate{ cfg.size.width + dx, cfg.size.height + dy };
++				uint64_t area = static_cast<uint64_t>(candidate.width) * candidate.height;
++				if ((area / 2) % 64 || candidate.width > sensorLimit.width ||
++				    candidate.height > sensorLimit.height || area >= bestArea)
++					continue;
++				best = candidate;
++				bestArea = area;
++			}
++		}
++		if (!best.width)
++			return -EINVAL;
++		LOG(HAL, Info) << "Internal chroma-aligned capture " << cfg.size << " -> " << best;
++		cfg.size = best;
++	}
++#endif
+ 	sortCamera3StreamConfigs(streamConfigs, jpegStream);
+-	for (const auto &streamConfig : streamConfigs) {
++	for (auto &streamConfig : streamConfigs) {
++#if !defined(OS_CHROMEOS)
++		streamConfig.config.bufferCount = std::min(12U, 4U * stream_list->num_streams);
++#endif
+ 		config->addConfiguration(streamConfig.config);
+ 
+ 		CameraStream *sourceStream = nullptr;
+@@ -724,7 +772,8 @@
+ 			 * be used when constructing the subsequent mapped
+ 			 * streams.
+ 			 */
+-			if (stream.type == CameraStream::Type::Direct)
++			if (stream.type == CameraStream::Type::Direct ||
++			    stream.type == CameraStream::Type::Internal)
+ 				sourceStream = &streams_.back();
+ 		}
+ 	}
+@@ -758,6 +807,9 @@
+ 	 * Once the CameraConfiguration has been adjusted/validated
+ 	 * it can be applied to the camera.
+ 	 */
++	for (const StreamConfiguration &cfg : *config)
++		LOG(HAL, Debug) << "ISP layout: " << cfg.toString()
++			       << " stride=" << cfg.stride << " frameSize=" << cfg.frameSize;
+ 	int ret = camera_->configure(config.get());
+ 	if (ret) {
+ 		LOG(HAL, Error) << "Failed to configure camera '"
+@@ -817,7 +869,36 @@
+ 	/* Translate the Android request settings to libcamera controls. */
+ 	ControlList &controls = descriptor->request_->controls();
+ 	camera_metadata_ro_entry_t entry;
+-	if (settings.getEntry(ANDROID_SCALER_CROP_REGION, &entry)) {
++	if (camera_->controls().count(controls::AfMode.id())) {
++		uint8_t afMode = ANDROID_CONTROL_AF_MODE_OFF;
++		if (settings.getEntry(ANDROID_CONTROL_AF_MODE, &entry))
++			afMode = *entry.data.u8;
++		int32_t mode = controls::AfModeManual;
++		if (afMode == ANDROID_CONTROL_AF_MODE_AUTO)
++			mode = controls::AfModeAuto;
++		else if (afMode == ANDROID_CONTROL_AF_MODE_CONTINUOUS_PICTURE ||
++			 afMode == ANDROID_CONTROL_AF_MODE_CONTINUOUS_VIDEO)
++			mode = controls::AfModeContinuous;
++		controls.set(controls::AfMode, mode);
++		if (mode == controls::AfModeManual && settings.getEntry(ANDROID_LENS_FOCUS_DISTANCE, &entry))
++			controls.set(controls::draft::AfLensPositionUncalibrated, *entry.data.f);
++		if (settings.getEntry(ANDROID_CONTROL_AF_TRIGGER, &entry)) {
++			uint8_t trigger = *entry.data.u8;
++			if (mode == controls::AfModeAuto) {
++				if (trigger == ANDROID_CONTROL_AF_TRIGGER_START)
++					controls.set(controls::AfTrigger, controls::AfTriggerStart);
++				else if (trigger == ANDROID_CONTROL_AF_TRIGGER_CANCEL)
++					controls.set(controls::AfTrigger, controls::AfTriggerCancel);
++			} else if (mode == controls::AfModeContinuous) {
++				if (trigger == ANDROID_CONTROL_AF_TRIGGER_START)
++					controls.set(controls::AfPause, controls::AfPauseDeferred);
++				else if (trigger == ANDROID_CONTROL_AF_TRIGGER_CANCEL)
++					controls.set(controls::AfPause, controls::AfPauseResume);
++			}
++		}
++	}
++	if (camera_->controls().count(controls::ScalerCrop.id()) &&
++	    settings.getEntry(ANDROID_SCALER_CROP_REGION, &entry)) {
+ 		const int32_t *data = entry.data.i32;
+ 		Rectangle cropRegion{ data[0], data[1],
+ 				      static_cast<unsigned int>(data[2]),
+@@ -1090,6 +1171,24 @@
+ 		requestedStreams.erase(sourceStream);
+ 	}
+ 
++#if !defined(OS_CHROMEOS)
++	/* rkisp1 needs three queued buffers per active path. Keep unrequested
++	 * native paths flowing during preview so a single still request does
++	 * not wait forever for the main path to start. */
++	for (CameraStream &stream : streams_) {
++		if (stream.type() != CameraStream::Type::Internal ||
++		    descriptor->request_->findBuffer(stream.stream()))
++			continue;
++		FrameBuffer *buffer = stream.getBuffer();
++		if (!buffer)
++			return -ENOMEM;
++		descriptor->implicitBuffers_.emplace_back(&stream, buffer);
++		int ret = descriptor->request_->addBuffer(stream.stream(), buffer);
++		if (ret)
++			return ret;
++	}
++#endif
++
+ 	/*
+ 	 * Translate controls from Android to libcamera and queue the request
+ 	 * to the camera.
+@@ -1131,6 +1230,7 @@
+ 
+ 	{
+ 		MutexLocker descriptorsLock(descriptorsMutex_);
++		activeRequests_[request] = descriptor.get();
+ 		descriptors_.push(std::move(descriptor));
+ 	}
+ 
+@@ -1141,8 +1241,23 @@
+ 
+ void CameraDevice::requestComplete(Request *request)
+ {
+-	Camera3RequestDescriptor *descriptor =
+-		reinterpret_cast<Camera3RequestDescriptor *>(request->cookie());
++	Camera3RequestDescriptor *descriptor;
++	{
++		MutexLocker lock(descriptorsMutex_);
++		auto found = activeRequests_.find(request);
++		if (found == activeRequests_.end()) {
++			/* Do not dereference a stale completion after session teardown. */
++			LOG(HAL, Warning) << "Ignoring inactive-session capture completion";
++			return;
++		}
++		descriptor = found->second;
++	}
++	if (request->cookie() != reinterpret_cast<uint64_t>(descriptor)) {
++		LOG(HAL, Error) << "Active capture request cookie mismatch";
++		abortRequest(descriptor);
++		completeDescriptor(descriptor);
++		return;
++	}
+ 
+ 	/*
+ 	 * Prepare the capture result for the Android camera stack.
+@@ -1300,6 +1415,7 @@
+ 	while (!descriptors_.empty() && !descriptors_.front()->isPending()) {
+ 		auto descriptor = std::move(descriptors_.front());
+ 		descriptors_.pop();
++		activeRequests_.erase(descriptor->request_.get());
+ 
+ 		camera3_capture_result_t captureResult = {};
+ 
+@@ -1335,6 +1451,9 @@
+ 		if (descriptor->status_ == Camera3RequestDescriptor::Status::Success)
+ 			captureResult.partial_result = 1;
+ 
++		for (const auto &[stream, buffer] : descriptor->implicitBuffers_)
++			stream->putBuffer(buffer);
++		descriptor->implicitBuffers_.clear();
+ 		callbacks_->process_capture_result(callbacks_, &captureResult);
+ 	}
+ }
+@@ -1496,12 +1615,30 @@
+ 	resultMetadata->addEntry(ANDROID_CONTROL_AE_STATE, value);
+ 
+ 	value = ANDROID_CONTROL_AF_MODE_OFF;
++	if (camera_->controls().count(controls::AfMode.id()) &&
++	    settings.getEntry(ANDROID_CONTROL_AF_MODE, &entry))
++		value = *entry.data.u8;
++	uint8_t afMode = value;
+ 	resultMetadata->addEntry(ANDROID_CONTROL_AF_MODE, value);
+ 
+ 	value = ANDROID_CONTROL_AF_STATE_INACTIVE;
++	if (auto state = metadata.get(controls::AfState)) {
++		bool continuous = afMode == ANDROID_CONTROL_AF_MODE_CONTINUOUS_PICTURE ||
++				  afMode == ANDROID_CONTROL_AF_MODE_CONTINUOUS_VIDEO;
++		bool paused = metadata.get(controls::AfPauseState).value_or(controls::AfPauseStateRunning)
++			      == controls::AfPauseStatePaused;
++		if (*state == controls::AfStateScanning)
++			value = continuous ? ANDROID_CONTROL_AF_STATE_PASSIVE_SCAN : ANDROID_CONTROL_AF_STATE_ACTIVE_SCAN;
++		else if (*state == controls::AfStateFocused)
++			value = continuous && !paused ? ANDROID_CONTROL_AF_STATE_PASSIVE_FOCUSED : ANDROID_CONTROL_AF_STATE_FOCUSED_LOCKED;
++		else if (*state == controls::AfStateFailed)
++			value = continuous && !paused ? ANDROID_CONTROL_AF_STATE_PASSIVE_UNFOCUSED : ANDROID_CONTROL_AF_STATE_NOT_FOCUSED_LOCKED;
++	}
+ 	resultMetadata->addEntry(ANDROID_CONTROL_AF_STATE, value);
+ 
+ 	value = ANDROID_CONTROL_AF_TRIGGER_IDLE;
++	if (settings.getEntry(ANDROID_CONTROL_AF_TRIGGER, &entry))
++		value = *entry.data.u8;
+ 	resultMetadata->addEntry(ANDROID_CONTROL_AF_TRIGGER, value);
+ 
+ 	value = ANDROID_CONTROL_AWB_MODE_AUTO;
+@@ -1541,7 +1678,11 @@
+ 	resultMetadata->addEntry(ANDROID_LENS_FOCAL_LENGTH, focal_length);
+ 
+ 	value = ANDROID_LENS_STATE_STATIONARY;
++	if (metadata.get(controls::draft::AfLensMoving).value_or(false))
++		value = ANDROID_LENS_STATE_MOVING;
+ 	resultMetadata->addEntry(ANDROID_LENS_STATE, value);
++	if (auto position = metadata.get(controls::draft::AfLensPositionUncalibrated))
++		resultMetadata->addEntry(ANDROID_LENS_FOCUS_DISTANCE, *position);
+ 
+ 	value = ANDROID_LENS_OPTICAL_STABILIZATION_MODE_OFF;
+ 	resultMetadata->addEntry(ANDROID_LENS_OPTICAL_STABILIZATION_MODE,
+diff --git a/src/libcamera/pipeline/rkisp1/rkisp1_path.cpp b/src/libcamera/pipeline/rkisp1/rkisp1_path.cpp
+--- a/src/libcamera/pipeline/rkisp1/rkisp1_path.cpp
++++ b/src/libcamera/pipeline/rkisp1/rkisp1_path.cpp
+@@ -280,7 +280,8 @@
+ 
+ 	cfg->size.boundTo(maxResolution);
+ 	cfg->size.expandTo(minResolution);
+-	cfg->bufferCount = RKISP1_BUFFER_COUNT;
++	/* Bounded reserve for Android paths also fed by implicit requests. */
++	cfg->bufferCount = std::clamp(cfg->bufferCount, RKISP1_BUFFER_COUNT, 12U);
+ 
+ 	V4L2DeviceFormat format;
+ 	format.fourcc = video_->toV4L2PixelFormat(cfg->pixelFormat);
+@@ -360,6 +361,7 @@
+ 		return -EINVAL;
+ 	}
+ 
++	bufferCount_ = config.bufferCount;
+ 	return 0;
+ }
+ 
+@@ -370,8 +372,9 @@
+ 	if (running_)
+ 		return -EBUSY;
+ 
+-	/* \todo Make buffer count user configurable. */
+-	ret = video_->importBuffers(RKISP1_BUFFER_COUNT);
++	/* Match the exported native pool, including concurrent still/preview
++	 * requests. Four import slots cannot queue a fifth outstanding buffer. */
++	ret = video_->importBuffers(bufferCount_);
+ 	if (ret)
+ 		return ret;
+ 
+diff --git a/src/libcamera/pipeline/rkisp1/rkisp1_path.h b/src/libcamera/pipeline/rkisp1/rkisp1_path.h
+--- a/src/libcamera/pipeline/rkisp1/rkisp1_path.h
++++ b/src/libcamera/pipeline/rkisp1/rkisp1_path.h
+@@ -67,6 +67,7 @@
+ 
+ 	const char *name_;
+ 	bool running_;
++	unsigned int bufferCount_ = RKISP1_BUFFER_COUNT;
+ 
+ 	const Span<const PixelFormat> formats_;
+ 	std::set<PixelFormat> streamFormats_;
+diff --git a/src/android/camera_device.h b/src/android/camera_device.h
+--- a/src/android/camera_device.h
++++ b/src/android/camera_device.h
+@@ -120,6 +120,8 @@
+ 	libcamera::Mutex descriptorsMutex_ LIBCAMERA_TSA_ACQUIRED_AFTER(stateMutex_);
+ 	std::queue<std::unique_ptr<Camera3RequestDescriptor>> descriptors_
+ 		LIBCAMERA_TSA_GUARDED_BY(descriptorsMutex_);
++	std::map<libcamera::Request *, Camera3RequestDescriptor *> activeRequests_
++		LIBCAMERA_TSA_GUARDED_BY(descriptorsMutex_);
+ 
+ 	std::string maker_;
+ 	std::string model_;
+diff --git a/src/android/camera_capabilities.cpp b/src/android/camera_capabilities.cpp
+--- a/src/android/camera_capabilities.cpp
++++ b/src/android/camera_capabilities.cpp
+@@ -963,6 +963,11 @@
+ 	std::vector<uint8_t> availableAfModes = {
+ 		ANDROID_CONTROL_AF_MODE_OFF,
+ 	};
++	if (camera_->controls().count(controls::AfMode.id())) {
++		availableAfModes.push_back(ANDROID_CONTROL_AF_MODE_AUTO);
++		availableAfModes.push_back(ANDROID_CONTROL_AF_MODE_CONTINUOUS_PICTURE);
++		availableAfModes.push_back(ANDROID_CONTROL_AF_MODE_CONTINUOUS_VIDEO);
++	}
+ 	staticMetadata_->addEntry(ANDROID_CONTROL_AF_AVAILABLE_MODES,
+ 				  availableAfModes);
+ 
+@@ -1248,6 +1253,16 @@
+ 				  hypeFocalDistance);
+ 
+ 	float minFocusDistance = 0;
++	if (camera_->controls().count(controls::draft::AfLensPositionUncalibrated.id())) {
++		/* Android explicitly permits unitless coordinates for an
++		 * UNCALIBRATED actuator; do not invent physical diopters. */
++		minFocusDistance = 1.0f;
++		uint8_t calibration = ANDROID_LENS_INFO_FOCUS_DISTANCE_CALIBRATION_UNCALIBRATED;
++		staticMetadata_->addEntry(ANDROID_LENS_INFO_FOCUS_DISTANCE_CALIBRATION, calibration);
++		availableCharacteristicsKeys_.insert(ANDROID_LENS_INFO_FOCUS_DISTANCE_CALIBRATION);
++		availableRequestKeys_.insert(ANDROID_LENS_FOCUS_DISTANCE);
++		availableResultKeys_.insert(ANDROID_LENS_FOCUS_DISTANCE);
++	}
+ 	staticMetadata_->addEntry(ANDROID_LENS_INFO_MINIMUM_FOCUS_DISTANCE,
+ 				  minFocusDistance);
+ 
+@@ -1531,10 +1546,14 @@
+ 				  aeAntibandingMode);
+ 
+ 	uint8_t afMode = ANDROID_CONTROL_AF_MODE_OFF;
++	if (camera_->controls().count(controls::AfMode.id()))
++		afMode = ANDROID_CONTROL_AF_MODE_CONTINUOUS_PICTURE;
+ 	requestTemplate->addEntry(ANDROID_CONTROL_AF_MODE, afMode);
+ 
+ 	uint8_t afTrigger = ANDROID_CONTROL_AF_TRIGGER_IDLE;
+ 	requestTemplate->addEntry(ANDROID_CONTROL_AF_TRIGGER, afTrigger);
++	if (camera_->controls().count(controls::draft::AfLensPositionUncalibrated.id()))
++		requestTemplate->addEntry(ANDROID_LENS_FOCUS_DISTANCE, 0.0f);
+ 
+ 	uint8_t awbMode = ANDROID_CONTROL_AWB_MODE_AUTO;
+ 	requestTemplate->addEntry(ANDROID_CONTROL_AWB_MODE, awbMode);
+diff --git a/src/android/camera_stream.cpp b/src/android/camera_stream.cpp
+--- a/src/android/camera_stream.cpp
++++ b/src/android/camera_stream.cpp
+@@ -131,8 +131,29 @@
+ 
+ 	allocator_ = std::make_unique<PlatformFrameBufferAllocator>(cameraDevice_);
+ 	mutex_ = std::make_unique<Mutex>();
+-
++#if !defined(OS_CHROMEOS)
++	if (type_ == Type::Internal) {
++		MutexLocker locker(*mutex_);
++		/* Export every configured path before the camera starts. A still
++		 * stream may first be requested after preview is already running. */
++		nativeAllocator_ = std::make_unique<FrameBufferAllocator>(cameraDevice_->camera());
++		int ret = nativeAllocator_->allocate(stream());
++		if (ret < 0)
++			return ret;
++		for (const auto &native : nativeAllocator_->buffers(stream())) {
++			allocatedBuffers_.push_back(std::make_unique<HALFrameBuffer>(native->planes(), nullptr));
++			buffers_.push_back(allocatedBuffers_.back().get());
++		}
++		if (buffers_.empty())
++			return -ENOMEM;
++	}
++#endif
++
++#if defined(OS_CHROMEOS)
+ 	camera3Stream_->max_buffers = configuration().bufferCount;
++#else
++	camera3Stream_->max_buffers = std::min(4U, configuration().bufferCount);
++#endif
+ 
+ 	return 0;
+ }
+@@ -203,6 +224,7 @@
+ 		return;
+ 
+ 	worker_->flush();
++	worker_->start();
+ }
+ 
+ FrameBuffer *CameraStream::getBuffer()
+@@ -222,9 +244,14 @@
+ 		 * \todo Store a reference to the format of the source stream
+ 		 * instead of hardcoding.
+ 		 */
++#if defined(OS_CHROMEOS)
+ 		auto frameBuffer = allocator_->allocate(HAL_PIXEL_FORMAT_YCBCR_420_888,
+ 							configuration().size,
+ 							camera3Stream_->usage);
++#else
++		/* Internal capture layout must come from the ISP, not gralloc. */
++		std::unique_ptr<HALFrameBuffer> frameBuffer;
++#endif
+ 		if (frameBuffer) {
+ 			allocatedBuffers_.push_back(std::move(frameBuffer));
+ 			buffers_.emplace_back(allocatedBuffers_.back().get());
+@@ -358,4 +385,5 @@
+ 	lock.unlock();
+ 
+ 	cv_.notify_one();
+-}
++	wait();
++}
+diff --git a/src/android/camera_request.cpp b/src/android/camera_request.cpp
+--- a/src/android/camera_request.cpp
++++ b/src/android/camera_request.cpp
+@@ -10,6 +10,7 @@
+ #include <libcamera/base/span.h>
+ 
+ #include "camera_buffer.h"
++#include "camera_stream.h"
+ 
+ using namespace libcamera;
+ 
+@@ -138,7 +139,11 @@
+ 	request_ = camera->createRequest(reinterpret_cast<uint64_t>(this));
+ }
+ 
+-Camera3RequestDescriptor::~Camera3RequestDescriptor() = default;
++Camera3RequestDescriptor::~Camera3RequestDescriptor()
++{
++	for (const auto &[stream, buffer] : implicitBuffers_)
++		stream->putBuffer(buffer);
++}
+ 
+ /**
+  * \struct Camera3RequestDescriptor::StreamBuffer
+diff --git a/src/android/camera_request.h b/src/android/camera_request.h
+--- a/src/android/camera_request.h
++++ b/src/android/camera_request.h
+@@ -10,6 +10,7 @@
+ #include <map>
+ #include <memory>
+ #include <vector>
++#include <utility>
+ 
+ #include <libcamera/base/class.h>
+ #include <libcamera/base/mutex.h>
+@@ -71,6 +72,9 @@
+ 	uint32_t frameNumber_ = 0;
+ 
+ 	std::vector<StreamBuffer> buffers_;
++	/* Native buffers keeping configured ISP paths streaming without an
++	 * Android output target in this particular request. */
++	std::vector<std::pair<CameraStream *, libcamera::FrameBuffer *>> implicitBuffers_;
+ 
+ 	CameraMetadata settings_;
+ 	std::unique_ptr<libcamera::Request> request_;
+diff --git a/src/android/mm/generic_camera_buffer.cpp b/src/android/mm/generic_camera_buffer.cpp
+--- a/src/android/mm/generic_camera_buffer.cpp
++++ b/src/android/mm/generic_camera_buffer.cpp
+@@ -8,6 +8,8 @@
+ #include "../camera_buffer.h"
+ 
+ #include <string.h>
++#include <fcntl.h>
++#include <android/hardware/graphics/mapper/4.0/IMapper.h>
+ #include <sys/mman.h>
+ #include <unistd.h>
+ 
+@@ -51,12 +53,17 @@
+ 	};
+ 
+ 	void map();
++	bool mapWithMapper4();
+ 
+ 	int fd_;
+ 	int flags_;
+ 	off_t bufferLength_;
+ 	bool mapped_;
+ 	std::vector<PlaneInfo> planeInfo_;
++	android::sp<android::hardware::graphics::mapper::V4_0::IMapper> mapper_;
++	void *imported_ = nullptr;
++	bool mapperLocked_ = false;
++	android::hardware::graphics::mapper::V4_0::IMapper::Rect mapperRegion_{};
+ };
+ 
+ CameraBuffer::Private::Private([[maybe_unused]] CameraBuffer *cameraBuffer,
+@@ -66,6 +73,16 @@
+ 	: fd_(-1), flags_(flags), bufferLength_(-1), mapped_(false)
+ {
+ 	error_ = 0;
++	mapper_ = android::hardware::graphics::mapper::V4_0::IMapper::getService();
++	if (mapper_) {
++		auto result = mapper_->importBuffer(android::hardware::hidl_handle(camera3Buffer),
++			[this](android::hardware::graphics::mapper::V4_0::Error error, void *buffer) {
++				if (error == android::hardware::graphics::mapper::V4_0::Error::NONE)
++					imported_ = buffer;
++			});
++		if (!result.isOk())
++			LOG(HAL, Error) << "Mapper4 import transport failed";
++	}
+ 
+ 	const auto &info = PixelFormatInfo::info(pixelFormat);
+ 	if (!info.isValid()) {
+@@ -75,6 +92,8 @@
+ 	}
+ 
+ 	auto cros_handle = reinterpret_cast<cros_gralloc_handle_t>(camera3Buffer);
++	mapperRegion_ = {0, 0, static_cast<int32_t>(cros_handle->width),
++			 static_cast<int32_t>(cros_handle->height)};
+ 
+ 	/*
+ 	 * As Android doesn't offer an API to query buffer layouts, assume for
+@@ -85,7 +104,10 @@
+ 		if (camera3Buffer->data[i] == -1 || camera3Buffer->data[i] == fd_)
+ 			continue;
+ 
+-		fd_ = camera3Buffer->data[0];
++		/* Processing runs asynchronously after the HAL call returns. Keep
++		 * our own fd instead of borrowing a transient imported handle fd. */
++		fd_ = fcntl(camera3Buffer->data[i], F_DUPFD_CLOEXEC, 0);
++		break;
+ 	}
+ 
+ 	if (fd_ == -1) {
+@@ -95,6 +117,8 @@
+ 	}
+ 
+ 	bufferLength_ = lseek(fd_, 0, SEEK_END);
++	LOG(HAL, Debug) << "Owned buffer fd=" << fd_ << " open_flags=" << fcntl(fd_, F_GETFL)
++		       << " length=" << bufferLength_;
+ 	if (bufferLength_ < 0) {
+ 		error_ = -errno;
+ 		LOG(HAL, Error) << "Failed to get buffer length";
+@@ -147,6 +171,23 @@
+ 
+ CameraBuffer::Private::~Private()
+ {
++	if (mapperLocked_) {
++		auto result = mapper_->unlock(imported_,
++			[](android::hardware::graphics::mapper::V4_0::Error error,
++			   const android::hardware::hidl_handle &) {
++				if (error != android::hardware::graphics::mapper::V4_0::Error::NONE)
++					LOG(HAL, Error) << "Mapper4 unlock failed: " << static_cast<int>(error);
++			});
++		if (!result.isOk())
++			LOG(HAL, Error) << "Mapper4 unlock transport failed";
++	}
++	if (imported_) {
++		auto result = mapper_->freeBuffer(imported_);
++		if (!result.isOk())
++			LOG(HAL, Error) << "Mapper4 free transport failed";
++	}
++	if (fd_ >= 0)
++		close(fd_);
+ }
+ 
+ unsigned int CameraBuffer::Private::numPlanes() const
+@@ -201,9 +242,19 @@
+ {
+ 	ASSERT(fd_ != -1);
+ 	ASSERT(bufferLength_ >= 0);
++	/* A writable PRIME fd is not sufficient for CPU/cache ownership.
++	 * Use the Android mapper's CPU lock/unlock whenever available. */
++	if (mapWithMapper4()) {
++		mapped_ = true;
++		return;
++	}
+ 
+ 	void *address = mmap(nullptr, bufferLength_, flags_, MAP_SHARED, fd_, 0);
+ 	if (address == MAP_FAILED) {
++		if (mapWithMapper4()) {
++			mapped_ = true;
++			return;
++		}
+ 		error_ = -errno;
+ 		LOG(HAL, Error) << "Failed to mmap plane: " << strerror(-error_)
+ 			       << " fd=" << fd_ << " prot=" << flags_;
+@@ -220,4 +271,26 @@
+ 	mapped_ = true;
+ }
+ 
++bool CameraBuffer::Private::mapWithMapper4()
++{
++	if (!mapper_ || !imported_ || mapperLocked_)
++		return false;
++	using Error = android::hardware::graphics::mapper::V4_0::Error;
++	uint64_t usage = (flags_ & PROT_WRITE) ? 0x30u : 0x3u;
++	void *address = nullptr;
++	auto result = mapper_->lock(imported_, usage, mapperRegion_, android::hardware::hidl_handle{},
++		[&](Error error, void *data) {
++			if (error == Error::NONE)
++				address = data;
++			else
++				LOG(HAL, Error) << "Mapper4 lock failed: " << static_cast<int>(error);
++		});
++	if (!result.isOk() || !address)
++		return false;
++	mapperLocked_ = true;
++	for (const auto &plane : planeInfo_)
++		planes_.emplace_back(static_cast<uint8_t *>(address) + plane.offset, plane.size);
++	return true;
++}
++
+ PUBLIC_CAMERA_BUFFER_IMPLEMENTATION
+diff --git a/src/android/yuv/post_processor_yuv.cpp b/src/android/yuv/post_processor_yuv.cpp
+--- a/src/android/yuv/post_processor_yuv.cpp
++++ b/src/android/yuv/post_processor_yuv.cpp
+@@ -53,6 +53,18 @@
+ {
+ 	const FrameBuffer &source = *streamBuffer->srcBuffer;
+ 	CameraBuffer *destination = streamBuffer->dstBuffer.get();
++	/* Gralloc may pad rows; the negotiated output width is not its stride. */
++	const PixelFormatInfo &nv12Info = PixelFormatInfo::info(formats::NV12);
++	for (unsigned int i = 0; i < 2; ++i) {
++		destinationStride_[i] = destination->stride(i);
++		if (destinationStride_[i] < destinationSize_.width) {
++			LOG(YUV, Error) << "Invalid destination stride " << destinationStride_[i];
++			processComplete.emit(streamBuffer, PostProcessor::Status::Error);
++			return;
++		}
++		destinationLength_[i] = nv12Info.planeSize(destinationSize_.height, i,
++							destinationStride_[i]);
++	}
+ 
+ 	if (!isValidBuffers(source, *destination)) {
+ 		processComplete.emit(streamBuffer, PostProcessor::Status::Error);
+@@ -62,6 +74,11 @@
+ 	const MappedFrameBuffer sourceMapped(&source, MappedFrameBuffer::MapFlag::Read);
+ 	if (!sourceMapped.isValid()) {
+ 		LOG(YUV, Error) << "Failed to mmap camera frame buffer";
++		processComplete.emit(streamBuffer, PostProcessor::Status::Error);
++		return;
++	}
++	if (destination->plane(0).empty() || destination->plane(1).empty()) {
++		LOG(YUV, Error) << "Failed to map Android destination planes";
+ 		processComplete.emit(streamBuffer, PostProcessor::Status::Error);
+ 		return;
+ 	}
+@@ -84,6 +101,8 @@
+ 		return;
+ 	}
+ 
++	/* Publish CPU writes through the mapper before returning the buffer. */
++	streamBuffer->dstBuffer.reset();
+ 	processComplete.emit(streamBuffer, PostProcessor::Status::Success);
+ }
+ 
+@@ -130,7 +149,9 @@
+ void PostProcessorYuv::calculateLengths(const StreamConfiguration &inCfg,
+ 					const StreamConfiguration &outCfg)
+ {
+-	sourceSize_ = inCfg.size;
++	/* Internal capture may include a small alignment border. Crop rather
++	 * than resample it, retaining Android's requested pixel dimensions. */
++	sourceSize_ = outCfg.size;
+ 	destinationSize_ = outCfg.size;
+ 
+ 	const PixelFormatInfo &nv12Info = PixelFormatInfo::info(formats::NV12);
+diff --git a/src/android/jpeg/encoder_libjpeg.cpp b/src/android/jpeg/encoder_libjpeg.cpp
+--- a/src/android/jpeg/encoder_libjpeg.cpp
++++ b/src/android/jpeg/encoder_libjpeg.cpp
+@@ -98,6 +98,7 @@
+ 	jpeg_set_defaults(&compress_);
+ 
+ 	pixelFormatInfo_ = &info.pixelFormatInfo;
++	stride_ = cfg.stride ? cfg.stride : pixelFormatInfo_->stride(cfg.size.width, 0);
+ 
+ 	nv_ = pixelFormatInfo_->numPlanes() == 2;
+ 	nvSwap_ = info.nvSwap;
+@@ -109,7 +110,7 @@
+ {
+ 	unsigned char *src = const_cast<unsigned char *>(planes[0].data());
+ 	/* \todo Stride information should come from buffer configuration. */
+-	unsigned int stride = pixelFormatInfo_->stride(compress_.image_width, 0);
++	unsigned int stride = stride_;
+ 
+ 	JSAMPROW row_pointer[1];
+ 
+@@ -135,10 +136,12 @@
+ 	 * Possible hints at:
+ 	 * https://sourceforge.net/p/libjpeg/mailman/message/30815123/
+ 	 */
+-	unsigned int y_stride = pixelFormatInfo_->stride(compress_.image_width, 0);
+-	unsigned int c_stride = pixelFormatInfo_->stride(compress_.image_width, 1);
+-
+-	unsigned int horzSubSample = 2 * compress_.image_width / c_stride;
++	unsigned int logical_y_stride = pixelFormatInfo_->stride(compress_.image_width, 0);
++	unsigned int logical_c_stride = pixelFormatInfo_->stride(compress_.image_width, 1);
++	unsigned int y_stride = stride_;
++	unsigned int c_stride = stride_ * logical_c_stride / logical_y_stride;
++
++	unsigned int horzSubSample = 2 * compress_.image_width / logical_c_stride;
+ 	unsigned int vertSubSample = pixelFormatInfo_->planes[1].verticalSubSampling;
+ 
+ 	unsigned int c_inc = horzSubSample == 1 ? 2 : 0;
+diff --git a/src/android/jpeg/encoder_libjpeg.h b/src/android/jpeg/encoder_libjpeg.h
+--- a/src/android/jpeg/encoder_libjpeg.h
++++ b/src/android/jpeg/encoder_libjpeg.h
+@@ -41,4 +41,5 @@
+ 
+ 	bool nv_;
+ 	bool nvSwap_;
++	unsigned int stride_ = 0;
+ };
+diff --git a/src/android/jpeg/post_processor_jpeg.cpp b/src/android/jpeg/post_processor_jpeg.cpp
+--- a/src/android/jpeg/post_processor_jpeg.cpp
++++ b/src/android/jpeg/post_processor_jpeg.cpp
+@@ -36,7 +36,7 @@
+ int PostProcessorJpeg::configure(const StreamConfiguration &inCfg,
+ 				 const StreamConfiguration &outCfg)
+ {
+-	if (inCfg.size != outCfg.size) {
++	if (inCfg.size.width < outCfg.size.width || inCfg.size.height < outCfg.size.height) {
+ 		LOG(JPEG, Error) << "Mismatch of input and output stream sizes";
+ 		return -EINVAL;
+ 	}
+@@ -56,7 +56,9 @@
+ 	encoder_ = std::make_unique<EncoderLibJpeg>();
+ #endif
+ 
+-	return encoder_->configure(inCfg);
++	StreamConfiguration encoding = inCfg;
++	encoding.size = outCfg.size;
++	return encoder_->configure(encoding);
+ }
+ 
+ void PostProcessorJpeg::generateThumbnail(const FrameBuffer &source,
+diff --git a/src/ipa/rkisp1/ipa_context.h b/src/ipa/rkisp1/ipa_context.h
+--- a/src/ipa/rkisp1/ipa_context.h
++++ b/src/ipa/rkisp1/ipa_context.h
+@@ -21,6 +21,11 @@
+ namespace ipa::rkisp1 {
+ 
+ struct IPASessionConfiguration {
++	struct {
++		bool available;
++		int32_t minimum;
++		int32_t maximum;
++	} lens;
+ 	struct {
+ 		struct rkisp1_cif_isp_window measureWindow;
+ 	} agc;
+@@ -53,6 +58,10 @@
+ };
+ 
+ struct IPAActiveState {
++	struct {
++		int32_t position;
++		bool update;
++	} af;
+ 	struct {
+ 		struct {
+ 			uint32_t exposure;
+diff --git a/src/ipa/rkisp1/rkisp1.cpp b/src/ipa/rkisp1/rkisp1.cpp
+--- a/src/ipa/rkisp1/rkisp1.cpp
++++ b/src/ipa/rkisp1/rkisp1.cpp
+@@ -6,6 +6,7 @@
+  */
+ 
+ #include <algorithm>
++#include <cmath>
+ #include <math.h>
+ #include <queue>
+ #include <stdint.h>
+@@ -52,6 +53,7 @@
+ 	int init(const IPASettings &settings, unsigned int hwRevision,
+ 		 const IPACameraSensorInfo &sensorInfo,
+ 		 const ControlInfoMap &sensorControls,
++		 const ControlInfoMap &lensControls,
+ 		 ControlInfoMap *ipaControls) override;
+ 	int start() override;
+ 	void stop() override;
+@@ -80,6 +82,7 @@
+ 	std::map<unsigned int, MappedFrameBuffer> mappedBuffers_;
+ 
+ 	ControlInfoMap sensorControls_;
++	ControlInfoMap lensControls_;
+ 
+ 	/* revision-specific data */
+ 	rkisp1_cif_isp_version hwRevision_;
+@@ -123,6 +126,7 @@
+ int IPARkISP1::init(const IPASettings &settings, unsigned int hwRevision,
+ 		    const IPACameraSensorInfo &sensorInfo,
+ 		    const ControlInfoMap &sensorControls,
++		    const ControlInfoMap &lensControls,
+ 		    ControlInfoMap *ipaControls)
+ {
+ 	/* \todo Add support for other revisions */
+@@ -192,6 +196,8 @@
+ 		return ret;
+ 
+ 	/* Initialize controls. */
++	lensControls_ = lensControls;
++	context_.configuration.lens.available = lensControls_.count(V4L2_CID_FOCUS_ABSOLUTE);
+ 	updateControls(sensorInfo, sensorControls, ipaControls);
+ 
+ 	return 0;
+@@ -222,6 +228,24 @@
+ 	const auto itGain = sensorControls_.find(V4L2_CID_ANALOGUE_GAIN);
+ 	int32_t minGain = itGain->second.min().get<int32_t>();
+ 	int32_t maxGain = itGain->second.max().get<int32_t>();
++
++	/* Some forward-ported sensor drivers advertise a zero linear gain.
++	 * AGC divides by the minimum gain and must never select zero EV.
++	 * Keep positive attenuation ranges intact; normalize only invalid
++	 * non-positive/non-finite minima using this sensor's unity gain code. */
++	double minimumAnalogueGain = camHelper_->gain(minGain);
++	if (!std::isfinite(minimumAnalogueGain) || minimumAnalogueGain <= 0.0) {
++		uint32_t unityCode = camHelper_->gainCode(1.0);
++		if (unityCode > static_cast<uint32_t>(maxGain))
++			return -EINVAL;
++		minGain = std::max(minGain, static_cast<int32_t>(unityCode));
++		minimumAnalogueGain = camHelper_->gain(minGain);
++		if (!std::isfinite(minimumAnalogueGain) || minimumAnalogueGain <= 0.0)
++			return -EINVAL;
++		int32_t defaultGain = std::clamp(itGain->second.def().get<int32_t>(), minGain, maxGain);
++		itGain->second = ControlInfo(ControlValue(minGain), ControlValue(maxGain), ControlValue(defaultGain));
++		LOG(IPARkISP1, Warning) << "Normalized non-positive sensor minimum gain to code " << minGain;
++	}
+ 
+ 	LOG(IPARkISP1, Debug)
+ 		<< "Exposure: [" << minExposure << ", " << maxExposure
+@@ -240,6 +264,13 @@
+ 	context_.configuration.sensor.defVBlank = vBlank.def().get<int32_t>();
+ 	context_.configuration.sensor.size = info.outputSize;
+ 	context_.configuration.sensor.lineDuration = info.minLineLength * 1.0s / info.pixelRate;
++	lensControls_ = ipaConfig.lensControls;
++	auto focus = lensControls_.find(V4L2_CID_FOCUS_ABSOLUTE);
++	if (focus != lensControls_.end()) {
++		context_.configuration.lens.available = true;
++		context_.configuration.lens.minimum = focus->second.min().get<int32_t>();
++		context_.configuration.lens.maximum = focus->second.max().get<int32_t>();
++	}
+ 
+ 	/* Update the camera controls using the new sensor settings. */
+ 	updateControls(info, sensorControls_, ipaControls);
+@@ -378,6 +409,12 @@
+ 			       ControlInfoMap *ipaControls)
+ {
+ 	ControlInfoMap::Map ctrlMap = rkisp1Controls;
++	if (context_.configuration.lens.available) {
++		ctrlMap[&controls::AfMode] = ControlInfo(controls::AfModeValues);
++		ctrlMap[&controls::AfTrigger] = ControlInfo(controls::AfTriggerValues);
++		ctrlMap[&controls::AfPause] = ControlInfo(controls::AfPauseValues);
++		ctrlMap[&controls::draft::AfLensPositionUncalibrated] = ControlInfo(0.0f, 1.0f, 0.0f);
++	}
+ 
+ 	/*
+ 	 * Compute exposure time limits from the V4L2_CID_EXPOSURE control
+@@ -447,6 +484,12 @@
+ 	ctrls.set(V4L2_CID_ANALOGUE_GAIN, static_cast<int32_t>(gain));
+ 
+ 	setSensorControls.emit(frame, ctrls);
++	if (context_.configuration.lens.available && context_.activeState.af.update) {
++		context_.activeState.af.update = false;
++		ControlList lensControls(lensControls_);
++		lensControls.set(V4L2_CID_FOCUS_ABSOLUTE, context_.activeState.af.position);
++		setLensControls.emit(lensControls);
++	}
+ }
+ 
+ } /* namespace ipa::rkisp1 */
+diff --git a/src/ipa/rkisp1/algorithms/af.cpp b/src/ipa/rkisp1/algorithms/af.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/ipa/rkisp1/algorithms/af.cpp
+@@ -0,0 +1,231 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/* RKISP1 ISP-statistics based autofocus. ISP AFC setup follows the public
++ * 2023 RKISP1 AF proposal by Daniel Semkowicz (Theobroma Systems).
++ * The bounded coarse/fine scan and Android pause behavior are implemented
++ * here for this older IPA ABI; front fixed-focus sensors remain unchanged. */
++#include "af.h"
++#include <algorithm>
++#include <cmath>
++#include <limits>
++#include <libcamera/control_ids.h>
++
++namespace libcamera::ipa::rkisp1::algorithms {
++LOG_DEFINE_CATEGORY(RkISP1Af)
++
++int Af::init(IPAContext &, const YamlObject &tuning)
++{
++	wait_ = std::clamp(tuning["wait-frames-lens"].get<uint32_t>(2), 1U, 10U);
++	warmup_ = std::clamp(tuning["warmup-frames"].get<uint32_t>(12), 0U, 60U);
++	threshold_ = tuning["isp-threshold"].get<uint32_t>(128);
++	return 0;
++}
++
++int Af::configure(IPAContext &context, const IPACameraSensorInfo &info)
++{
++	mode_ = controls::AfModeManual;
++	state_ = controls::AfStateIdle;
++	positions_.clear();
++	paused_ = pauseDeferred_ = false;
++	settling_ = false;
++	moving_ = false;
++	configureWindow_ = true;
++	skip_ = warmup_;
++	cooldown_ = lowContrast_ = 0;
++	reference_ = referenceSum_ = 0;
++	referenceSamples_ = 0;
++	if (!context.configuration.lens.available)
++		return 0;
++	if (context.configuration.lens.maximum <= context.configuration.lens.minimum)
++		return -EINVAL;
++	/* Stay away from sensor borders, use an even central metering window. */
++	unsigned int width = std::max(16U, info.outputSize.width / 3) & ~1U;
++	unsigned int height = std::max(16U, info.outputSize.height / 3) & ~1U;
++	window_ = { static_cast<uint16_t>((info.outputSize.width - width) / 2 & ~1U),
++		    static_cast<uint16_t>((info.outputSize.height - height) / 2 & ~1U),
++		    static_cast<uint16_t>(width), static_cast<uint16_t>(height) };
++	/* Establish a known actuator origin at stream start, including AF OFF.
++	 * The first IPA start emits this control before any result metadata. */
++	move(context, context.configuration.lens.minimum);
++	skip_ = std::max(skip_, warmup_);
++	return 0;
++}
++
++void Af::move(IPAContext &context, int32_t position)
++{
++	context.activeState.af.position = std::clamp(position,
++		context.configuration.lens.minimum, context.configuration.lens.maximum);
++	context.activeState.af.update = true;
++	moving_ = true;
++	skip_ = wait_;
++	samples_ = 0;
++	score_ = 0;
++	LOG(RkISP1Af, Debug) << "AF lens position " << context.activeState.af.position;
++}
++
++void Af::beginScan(IPAContext &context)
++{
++	const auto &lens = context.configuration.lens;
++	positions_.clear();
++	for (int i = 0; i <= 8; ++i)
++		positions_.push_back(lens.minimum + (lens.maximum - lens.minimum) * i / 8);
++	index_ = 0;
++	fine_ = false;
++	settling_ = false;
++	best_ = 0;
++	lowest_ = std::numeric_limits<double>::max();
++	bestPosition_ = lens.minimum;
++	state_ = controls::AfStateScanning;
++	unsigned int warmup = skip_;
++	move(context, positions_[0]);
++	skip_ = std::max(skip_, warmup);
++	LOG(RkISP1Af, Info) << "AF scan started, range " << lens.minimum << ".." << lens.maximum;
++}
++
++void Af::queueRequest(IPAContext &context, uint32_t, IPAFrameContext &, const ControlList &request)
++{
++	if (!context.configuration.lens.available)
++		return;
++	if (auto position = request.get(controls::draft::AfLensPositionUncalibrated);
++	    position && std::isfinite(*position) &&
++	    request.get(controls::AfMode).value_or(mode_) == controls::AfModeManual) {
++		const auto &lens = context.configuration.lens;
++		int32_t target = lens.minimum + std::lround(std::clamp(*position, 0.0f, 1.0f) *
++			(lens.maximum - lens.minimum));
++		if (target != context.activeState.af.position)
++			move(context, target);
++	}
++	if (auto mode = request.get(controls::AfMode); mode && *mode != mode_) {
++		mode_ = *mode;
++		paused_ = pauseDeferred_ = false;
++		positions_.clear();
++		state_ = controls::AfStateIdle;
++		settling_ = false;
++		if (mode_ == controls::AfModeContinuous)
++			beginScan(context);
++	}
++	if (auto pause = request.get(controls::AfPause); pause && mode_ == controls::AfModeContinuous) {
++		if (*pause == controls::AfPauseResume) {
++			paused_ = pauseDeferred_ = false;
++		} else if (*pause == controls::AfPauseImmediate) {
++			paused_ = true;
++		} else {
++			pauseDeferred_ = state_ == controls::AfStateScanning;
++			paused_ = !pauseDeferred_;
++		}
++	}
++	if (auto trigger = request.get(controls::AfTrigger); trigger && mode_ == controls::AfModeAuto) {
++		if (*trigger == controls::AfTriggerStart && state_ != controls::AfStateScanning)
++			beginScan(context);
++		else if (*trigger == controls::AfTriggerCancel) {
++			positions_.clear();
++			state_ = controls::AfStateIdle;
++			settling_ = false;
++		}
++	}
++}
++
++void Af::prepare(IPAContext &context, uint32_t, IPAFrameContext &, rkisp1_params_cfg *params)
++{
++	if (!context.configuration.lens.available || !configureWindow_)
++		return;
++	params->meas.afc_config.num_afm_win = 1;
++	params->meas.afc_config.thres = threshold_;
++	params->meas.afc_config.var_shift = 4;
++	params->meas.afc_config.afm_win[0] = window_;
++	params->module_cfg_update |= RKISP1_CIF_ISP_MODULE_AFC;
++	params->module_ens |= RKISP1_CIF_ISP_MODULE_AFC;
++	params->module_en_update |= RKISP1_CIF_ISP_MODULE_AFC;
++	configureWindow_ = false;
++}
++
++void Af::metadata(const IPAContext &context, ControlList &result) const
++{
++	result.set(controls::AfState, state_);
++	const auto &lens = context.configuration.lens;
++	result.set(controls::draft::AfLensPositionUncalibrated,
++		static_cast<float>(context.activeState.af.position - lens.minimum) /
++		(lens.maximum - lens.minimum));
++	result.set(controls::draft::AfLensMoving, moving_);
++	result.set(controls::AfPauseState, paused_ ? controls::AfPauseStatePaused :
++		pauseDeferred_ ? controls::AfPauseStatePausing : controls::AfPauseStateRunning);
++}
++
++void Af::process(IPAContext &context, uint32_t, IPAFrameContext &,
++		 const rkisp1_stat_buffer *stats, ControlList &result)
++{
++	if (!context.configuration.lens.available)
++		return;
++	metadata(context, result);
++	if (paused_ || !stats || !(stats->meas_type & RKISP1_CIF_ISP_STAT_AFM))
++		return;
++	if (skip_) { if (!--skip_) moving_ = false; return; }
++	if (settling_) {
++		settling_ = false;
++		state_ = settledState_;
++		paused_ = pauseDeferred_;
++		pauseDeferred_ = false;
++		metadata(context, result);
++		LOG(RkISP1Af, Info) << "AF scan finished position " << bestPosition_ << " state " << state_
++			<< " contrast " << best_;
++		return;
++	}
++	const auto &af = stats->params.af.window[0];
++	if (!af.lum)
++		return;
++	/* Use the ISP's actual sharpness measure. Luminance can have transient
++	 * low samples in binned mode; dividing by its square turned those into
++	 * false focus peaks even when the sharpness itself remained low. */
++	double contrast = static_cast<double>(af.sum);
++	if (!std::isfinite(contrast))
++		return;
++	if (state_ != controls::AfStateScanning) {
++		/* Establish CAF tracking from the settled lens, not the maximum
++		 * measured while the lens/exposure were sweeping. */
++		if (state_ == controls::AfStateFocused && referenceSamples_ < 8) {
++			referenceSum_ += contrast;
++			if (++referenceSamples_ == 8)
++				reference_ = referenceSum_ / referenceSamples_;
++			return;
++		}
++		if (cooldown_) { --cooldown_; return; }
++		if (mode_ == controls::AfModeContinuous && !pauseDeferred_ && reference_ > 0) {
++			lowContrast_ = contrast < reference_ * 0.55 ? lowContrast_ + 1 : 0;
++			if (lowContrast_ >= 8) { lowContrast_ = 0; beginScan(context); }
++		}
++		return;
++	}
++	score_ += contrast;
++	if (++samples_ < 2)
++		return;
++	double score = score_ / samples_;
++	lowest_ = std::min(lowest_, score);
++	if (score > best_) { best_ = score; bestPosition_ = positions_[index_]; }
++	LOG(RkISP1Af, Debug) << "AF sample " << positions_[index_] << " contrast " << score
++			  << " sum=" << af.sum << " lum=" << af.lum;
++	if (++index_ < positions_.size()) { move(context, positions_[index_]); return; }
++	if (!fine_) {
++		const auto &lens = context.configuration.lens;
++		int32_t radius = std::max(1, (lens.maximum - lens.minimum) / 8);
++		int32_t low = std::max(lens.minimum, bestPosition_ - radius);
++		int32_t high = std::min(lens.maximum, bestPosition_ + radius);
++		positions_.clear();
++		for (int i = 0; i <= 6; ++i) positions_.push_back(low + (high - low) * i / 6);
++		index_ = 0;
++		fine_ = true;
++		/* Fine-pass confidence must not inherit the coarse pass's
++		 * initial exposure transient or an old, incomparable peak. */
++		best_ = 0;
++		lowest_ = std::numeric_limits<double>::max();
++		move(context, positions_[0]);
++		return;
++	}
++	move(context, bestPosition_);
++	settledState_ = best_ > 0 && lowest_ < best_ * 0.9 ? controls::AfStateFocused : controls::AfStateFailed;
++	settling_ = true;
++	reference_ = referenceSum_ = 0;
++	referenceSamples_ = 0;
++	cooldown_ = 90;
++}
++
++REGISTER_IPA_ALGORITHM(Af, "Af")
++} /* namespace libcamera::ipa::rkisp1::algorithms */
+diff --git a/src/ipa/rkisp1/algorithms/af.h b/src/ipa/rkisp1/algorithms/af.h
+new file mode 100644
+--- /dev/null
++++ b/src/ipa/rkisp1/algorithms/af.h
+@@ -0,0 +1,39 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <vector>
++#include "algorithm.h"
++
++namespace libcamera::ipa::rkisp1::algorithms {
++
++/* Bounded contrast scan using the ISP AF statistics, not copied YUV images.
++ * Lens values stay in the V4L2 driver domain; no uncalibrated diopters are
++ * exposed as LensPosition. */
++class Af : public Algorithm
++{
++public:
++	int init(IPAContext &, const YamlObject &) override;
++	int configure(IPAContext &, const IPACameraSensorInfo &) override;
++	void queueRequest(IPAContext &, uint32_t, IPAFrameContext &, const ControlList &) override;
++	void prepare(IPAContext &, uint32_t, IPAFrameContext &, rkisp1_params_cfg *) override;
++	void process(IPAContext &, uint32_t, IPAFrameContext &, const rkisp1_stat_buffer *, ControlList &) override;
++
++private:
++	void beginScan(IPAContext &);
++	void move(IPAContext &, int32_t);
++	void metadata(const IPAContext &, ControlList &) const;
++	std::vector<int32_t> positions_;
++	rkisp1_cif_isp_window window_{};
++	int32_t mode_ = 0, state_ = 0, bestPosition_ = 0;
++	unsigned int index_ = 0, skip_ = 0, samples_ = 0, cooldown_ = 0, lowContrast_ = 0;
++	unsigned int wait_ = 2, warmup_ = 12, threshold_ = 128;
++	double score_ = 0, best_ = 0, lowest_ = 0, reference_ = 0;
++	double referenceSum_ = 0;
++	unsigned int referenceSamples_ = 0;
++	bool configureWindow_ = true, fine_ = false, paused_ = false, pauseDeferred_ = false;
++	bool settling_ = false;
++	bool moving_ = false;
++	int32_t settledState_ = 0;
++};
++
++} /* namespace libcamera::ipa::rkisp1::algorithms */
+diff --git a/src/ipa/rkisp1/algorithms/meson.build b/src/ipa/rkisp1/algorithms/meson.build
+--- a/src/ipa/rkisp1/algorithms/meson.build
++++ b/src/ipa/rkisp1/algorithms/meson.build
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: CC0-1.0
+ 
+ rkisp1_ipa_algorithms = files([
++    'af.cpp',
+     'agc.cpp',
+     'awb.cpp',
+     'blc.cpp',
+diff --git a/src/ipa/rkisp1/data/imx258.yaml b/src/ipa/rkisp1/data/imx258.yaml
+--- a/src/ipa/rkisp1/data/imx258.yaml
++++ b/src/ipa/rkisp1/data/imx258.yaml
+@@ -3,6 +3,11 @@
+ ---
+ version: 1
+ algorithms:
++  - Af:
++      # Account for queued ISP statistics plus physical actuator settling.
++      wait-frames-lens: 8
++      warmup-frames: 24
++      isp-threshold: 128
+   - Agc:
+   - Awb:
+   - LensShadingCorrection:
+@@ -51,4 +56,3 @@
+           gr: [1219, 1156, 1145, 1130, 1128, 1112, 1116, 1104, 1112, 1106, 1118, 1128, 1154, 1165, 1161, 1170, 1306, 1183, 1124, 1113, 1099, 1100, 1099, 1091, 1084, 1095, 1090, 1099, 1116, 1126, 1140, 1142, 1158, 1213, 1174, 1112, 1103, 1094, 1084, 1087, 1090, 1075, 1075, 1077, 1088, 1101, 1119, 1133, 1149, 1162, 1193, 1149, 1106, 1091, 1086, 1076, 1071, 1066, 1057, 1064, 1064, 1074, 1082, 1109, 1117, 1140, 1151, 1204, 1155, 1094, 1089, 1088, 1075, 1059, 1052, 1046, 1043, 1048, 1061, 1074, 1101, 1113, 1123, 1154, 1198, 1137, 1093, 1082, 1078, 1059, 1048, 1041, 1033, 1030, 1038, 1048, 1059, 1078, 1109, 1116, 1143, 1198, 1119, 1082, 1074, 1071, 1051, 1040, 1036, 1032, 1031, 1031, 1042, 1047, 1077, 1097, 1112, 1133, 1185, 1126, 1082, 1077, 1058, 1039, 1029, 1025, 1024, 1024, 1022, 1033, 1044, 1068, 1095, 1099, 1131, 1187, 1123, 1078, 1071, 1060, 1043, 1028, 1025, 1027, 1027, 1021, 1033, 1045, 1066, 1087, 1105, 1121, 1173, 1121, 1070, 1067, 1058, 1039, 1024, 1020, 1024, 1024, 1022, 1030, 1043, 1064, 1093, 1099, 1121, 1182, 1112, 1076, 1072, 1065, 1044, 1029, 1021, 1023, 1021, 1026, 1032, 1047, 1066, 1091, 1105, 1131, 1180, 1132, 1076, 1066, 1067, 1052, 1031, 1021, 1021, 1020, 1028, 1039, 1044, 1076, 1098, 1107, 1127, 1179, 1124, 1087, 1076, 1076, 1064, 1036, 1018, 1018, 1020, 1028, 1041, 1056, 1085, 1086, 1106, 1128, 1187, 1126, 1099, 1082, 1072, 1065, 1043, 1031, 1024, 1029, 1034, 1052, 1065, 1074, 1094, 1111, 1127, 1181, 1128, 1086, 1076, 1073, 1072, 1058, 1050, 1046, 1039, 1048, 1059, 1074, 1070, 1096, 1112, 1124, 1174, 1140, 1078, 1077, 1067, 1057, 1055, 1043, 1040, 1042, 1042, 1054, 1069, 1075, 1088, 1099, 1112, 1189, 1182, 1099, 1096, 1093, 1082, 1080, 1072, 1055, 1059, 1061, 1076, 1095, 1090, 1112, 1113, 1140, 1321, ]
+           gb: [1236, 1163, 1136, 1120, 1113, 1111, 1109, 1101, 1104, 1099, 1102, 1140, 1141, 1158, 1170, 1194, 1332, 1195, 1138, 1114, 1109, 1097, 1098, 1092, 1089, 1085, 1089, 1098, 1117, 1125, 1141, 1155, 1156, 1232, 1186, 1125, 1108, 1095, 1099, 1081, 1078, 1075, 1073, 1073, 1083, 1097, 1118, 1128, 1148, 1166, 1218, 1171, 1107, 1099, 1091, 1086, 1069, 1059, 1051, 1049, 1064, 1071, 1088, 1110, 1118, 1137, 1162, 1225, 1171, 1099, 1092, 1085, 1069, 1057, 1051, 1041, 1036, 1050, 1055, 1077, 1092, 1118, 1133, 1151, 1227, 1158, 1099, 1090, 1086, 1061, 1043, 1039, 1028, 1036, 1039, 1048, 1060, 1091, 1110, 1117, 1147, 1216, 1152, 1086, 1082, 1073, 1054, 1040, 1026, 1028, 1029, 1032, 1040, 1051, 1076, 1104, 1115, 1139, 1222, 1141, 1088, 1078, 1073, 1048, 1034, 1026, 1025, 1025, 1022, 1033, 1051, 1077, 1104, 1115, 1129, 1202, 1154, 1081, 1080, 1069, 1050, 1029, 1023, 1022, 1029, 1027, 1031, 1050, 1070, 1098, 1107, 1127, 1188, 1146, 1090, 1078, 1065, 1044, 1029, 1015, 1022, 1024, 1025, 1035, 1053, 1071, 1104, 1102, 1136, 1207, 1152, 1083, 1078, 1073, 1042, 1027, 1024, 1024, 1016, 1024, 1037, 1056, 1076, 1106, 1111, 1130, 1197, 1146, 1086, 1076, 1074, 1046, 1031, 1023, 1018, 1021, 1026, 1043, 1051, 1081, 1102, 1111, 1126, 1191, 1134, 1090, 1084, 1079, 1067, 1038, 1019, 1018, 1021, 1033, 1041, 1055, 1081, 1099, 1107, 1131, 1199, 1147, 1091, 1082, 1083, 1072, 1050, 1031, 1024, 1027, 1032, 1053, 1063, 1082, 1099, 1107, 1130, 1191, 1139, 1087, 1078, 1077, 1073, 1058, 1048, 1037, 1037, 1046, 1062, 1073, 1079, 1099, 1099, 1130, 1177, 1147, 1082, 1087, 1074, 1061, 1062, 1052, 1042, 1036, 1045, 1063, 1068, 1079, 1094, 1103, 1120, 1189, 1176, 1105, 1102, 1092, 1081, 1073, 1064, 1053, 1053, 1066, 1067, 1084, 1087, 1103, 1134, 1146, 1336, ]
+           b: [1203, 1195, 1154, 1123, 1104, 1106, 1116, 1099, 1099, 1099, 1102, 1106, 1123, 1155, 1149, 1168, 1283, 1196, 1141, 1119, 1102, 1098, 1088, 1088, 1095, 1086, 1095, 1097, 1101, 1117, 1121, 1156, 1135, 1209, 1211, 1127, 1102, 1082, 1089, 1088, 1072, 1075, 1083, 1083, 1085, 1106, 1107, 1120, 1142, 1149, 1224, 1163, 1121, 1087, 1078, 1085, 1077, 1062, 1065, 1056, 1057, 1082, 1093, 1094, 1096, 1111, 1147, 1193, 1179, 1105, 1083, 1088, 1070, 1074, 1060, 1048, 1055, 1044, 1068, 1082, 1091, 1097, 1102, 1141, 1209, 1178, 1091, 1076, 1077, 1063, 1060, 1043, 1043, 1035, 1046, 1059, 1064, 1084, 1103, 1107, 1125, 1196, 1156, 1088, 1068, 1070, 1057, 1043, 1046, 1041, 1038, 1038, 1046, 1059, 1073, 1083, 1086, 1111, 1178, 1146, 1067, 1083, 1068, 1044, 1042, 1033, 1044, 1033, 1026, 1037, 1045, 1067, 1089, 1092, 1108, 1203, 1148, 1082, 1072, 1066, 1050, 1044, 1035, 1035, 1031, 1028, 1035, 1055, 1069, 1082, 1094, 1101, 1188, 1163, 1067, 1074, 1056, 1040, 1034, 1037, 1026, 1022, 1033, 1037, 1049, 1067, 1084, 1092, 1103, 1185, 1156, 1074, 1073, 1066, 1042, 1036, 1028, 1031, 1030, 1034, 1042, 1051, 1073, 1091, 1090, 1102, 1196, 1172, 1086, 1071, 1077, 1055, 1041, 1036, 1025, 1024, 1028, 1032, 1053, 1076, 1094, 1089, 1101, 1178, 1179, 1095, 1079, 1075, 1070, 1043, 1026, 1022, 1022, 1029, 1045, 1054, 1078, 1075, 1092, 1120, 1179, 1193, 1091, 1074, 1061, 1064, 1056, 1043, 1034, 1026, 1027, 1039, 1060, 1081, 1070, 1078, 1115, 1205, 1172, 1096, 1069, 1060, 1071, 1055, 1044, 1035, 1027, 1043, 1048, 1063, 1054, 1065, 1083, 1122, 1186, 1158, 1088, 1060, 1043, 1037, 1037, 1031, 1033, 1025, 1029, 1035, 1041, 1041, 1060, 1084, 1114, 1202, 1217, 1122, 1101, 1079, 1058, 1061, 1049, 1056, 1051, 1036, 1062, 1061, 1076, 1094, 1116, 1139, 1331, ]
+-

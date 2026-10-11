@@ -1,0 +1,163 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenCode <noreply@opencode.local>
+Date: Sat, 10 Oct 2026 03:50:00 +0800
+Subject: [PATCH] btlinux: check callback transport status and initialize resources
+
+Real-device testing found the HAL aborting after its framework callback
+died because HIDL Return values were discarded without being checked.
+Check all packet callback returns, and guard initialization/teardown of
+the controller resources. Do not stop the fd watcher from its own packet
+callback; the registered death recipient performs teardown separately.
+
+This addresses a secondary HAL abort, not the originating system_server
+Binder failure. It was built and exercised with independent classic and BLE
+scans; mixed scanning and known-peer pairing are not claimed as fixed.
+
+diff --git a/system/vendor_libs/linux/interface/bluetooth_hci.cc b/system/vendor_libs/linux/interface/bluetooth_hci.cc
+index fe5a86a..ac75c6d 100644
+--- a/system/vendor_libs/linux/interface/bluetooth_hci.cc
++++ b/system/vendor_libs/linux/interface/bluetooth_hci.cc
+@@ -87,6 +87,7 @@ int BluetoothHci::openBtHci() {
+   if (waitHciDev(hci_interface)) {
+     ALOGE( "HCI interface (%d) not found", hci_interface);
+     ::close(fd);
++    bt_soc_fd_ = -1;
+     return -1;
+   }
+   struct sockaddr_hci addr;
+@@ -97,6 +98,7 @@ int BluetoothHci::openBtHci() {
+   if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+     ALOGE( "HCI Channel Control: %s", strerror(errno));
+     ::close(fd);
++    bt_soc_fd_ = -1;
+     return -1;
+   }
+   ALOGI( "HCI device ready");
+@@ -110,6 +112,7 @@ void BluetoothHci::closeBtHci() {
+   }
+   rfKill(0);
+   free(rfkill_state_);
++  rfkill_state_ = nullptr;
+ }
+ 
+ int BluetoothHci::waitHciDev(int hci_interface) {
+@@ -292,20 +295,54 @@ Return<void> BluetoothHci::initialize_impl(
+   }
+ 
+   death_recipient_->setHasDied(false);
+-  cb->linkToDeath(death_recipient_, 0);
++  auto death_status = cb->linkToDeath(death_recipient_, 0);
++  if (!death_status.isOk()) {
++    ALOGE("Unable to register Bluetooth callback death recipient: %s",
++          death_status.description().c_str());
++    return Void();
++  }
+   int hci_fd = openBtHci();
+   auto hidl_status = cb->initializationComplete(
+-      hci_fd > 0 ? V1_0::Status::SUCCESS : V1_0::Status::INITIALIZATION_ERROR);
++      hci_fd >= 0 ? V1_0::Status::SUCCESS : V1_0::Status::INITIALIZATION_ERROR);
+   if (!hidl_status.isOk()) {
+-      ALOGE("VendorInterface -> Unable to call initializationComplete(ERR)");
++    ALOGE("Unable to deliver initializationComplete: %s",
++          hidl_status.description().c_str());
++    closeBtHci();
++    return Void();
++  }
++  if (hci_fd < 0) {
++    closeBtHci();
++    return Void();
+   }
+   hci::H4Protocol* h4_hci = new hci::H4Protocol(
+       hci_fd,
+-      [cb](const hidl_vec<uint8_t>& packet) { cb->hciEventReceived(packet); },
+-      [cb](const hidl_vec<uint8_t>& packet) { cb->aclDataReceived(packet); },
+-      [cb](const hidl_vec<uint8_t>& packet) { cb->scoDataReceived(packet); },
++      [cb](const hidl_vec<uint8_t>& packet) {
++        auto status = cb->hciEventReceived(packet);
++        if (!status.isOk()) {
++          ALOGE("HCI callback transport failed: %s", status.description().c_str());
++        }
++      },
++      [cb](const hidl_vec<uint8_t>& packet) {
++        auto status = cb->aclDataReceived(packet);
++        if (!status.isOk()) {
++          ALOGE("ACL callback transport failed: %s", status.description().c_str());
++        }
++      },
++      [cb](const hidl_vec<uint8_t>& packet) {
++        auto status = cb->scoDataReceived(packet);
++        if (!status.isOk()) {
++          ALOGE("SCO callback transport failed: %s", status.description().c_str());
++        }
++      },
+       [cb_1_1](const hidl_vec<uint8_t>& packet) {
+-        cb_1_1->isoDataReceived(packet);
++        if (cb_1_1 == nullptr) {
++          ALOGW("Ignoring ISO packet for a Bluetooth 1.0 callback");
++          return;
++        }
++        auto status = cb_1_1->isoDataReceived(packet);
++        if (!status.isOk()) {
++          ALOGE("ISO callback transport failed: %s", status.description().c_str());
++        }
+       });
+ 
+   fd_watcher_.WatchFdForNonBlockingReads(
+@@ -315,8 +352,13 @@ Return<void> BluetoothHci::initialize_impl(
+   unlink_cb_ = [cb](sp<BluetoothDeathRecipient>& death_recipient) {
+     if (death_recipient->getHasDied())
+       ALOGI("Skipping unlink call, service died.");
+-    else
+-      cb->unlinkToDeath(death_recipient);
++    else {
++      auto status = cb->unlinkToDeath(death_recipient);
++      if (!status.isOk()) {
++        ALOGE("Unable to unlink Bluetooth callback: %s",
++              status.description().c_str());
++      }
++    }
+   };
+ 
+   return Void();
+@@ -324,7 +366,10 @@ Return<void> BluetoothHci::initialize_impl(
+ 
+ Return<void> BluetoothHci::close() {
+   ALOGI("BluetoothHci::close()");
+-  unlink_cb_(death_recipient_);
++  if (unlink_cb_) {
++    unlink_cb_(death_recipient_);
++    unlink_cb_ = nullptr;
++  }
+   fd_watcher_.StopWatchingFileDescriptors();
+ 
+   if (hci_handle_ != nullptr) {
+@@ -357,6 +402,10 @@ Return<void> BluetoothHci::sendIsoData(const hidl_vec<uint8_t>& data) {
+ 
+ void BluetoothHci::sendDataToController(const uint8_t type,
+                                         const hidl_vec<uint8_t>& data) {
++  if (hci_handle_ == nullptr) {
++    ALOGW("Ignoring HCI data while the controller is not initialized");
++    return;
++  }
+   hci_handle_->Send(type, data.data(), data.size());
+ }
+ 
+diff --git a/system/vendor_libs/linux/interface/bluetooth_hci.h b/system/vendor_libs/linux/interface/bluetooth_hci.h
+index 095c10c..b5e8dca 100644
+--- a/system/vendor_libs/linux/interface/bluetooth_hci.h
++++ b/system/vendor_libs/linux/interface/bluetooth_hci.h
+@@ -56,9 +56,9 @@ class BluetoothHci : public IBluetoothHci {
+       const ::android::sp<V1_1::IBluetoothHciCallbacks>& cb_1_1);
+ 
+   async::AsyncFdWatcher fd_watcher_;
+-  hci::H4Protocol* hci_handle_;
+-  int bt_soc_fd_;
+-  char *rfkill_state_;
++  hci::H4Protocol* hci_handle_ = nullptr;
++  int bt_soc_fd_ = -1;
++  char *rfkill_state_ = nullptr;
+ 
+   const uint8_t HCI_DATA_TYPE_COMMAND = 1;
+   const uint8_t HCI_DATA_TYPE_ACL = 2;
+-- 
+2.51.0

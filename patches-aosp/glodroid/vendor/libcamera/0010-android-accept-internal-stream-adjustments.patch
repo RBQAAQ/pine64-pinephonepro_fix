@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenCode <noreply@opencode.local>
+Date: Sun, 11 Oct 2026 22:30:00 +0800
+Subject: [PATCH] android accept internal stream adjustments
+
+Built and verified on the PinePhone Pro. See docs/VERIFIED_REPAIRS.md
+for the exact validation scope and remaining limitations.
+
+---
+diff --git a/src/android/camera_device.cpp b/src/android/camera_device.cpp
+index 1f7ce44..d27c833 100644
+--- a/src/android/camera_device.cpp
++++ b/src/android/camera_device.cpp
+@@ -735,10 +735,20 @@ int CameraDevice::configureStreams(camera3_stream_configuration_t *stream_list)
+ 	case CameraConfiguration::Adjusted:
+ 		LOG(HAL, Info) << "Camera configuration adjusted";
+ 
+-		for (const StreamConfiguration &cfg : *config)
++		/* Pipeline validation also adjusts internal buffer/transform
++		 * settings. Those changes need not invalidate Android's requested
++		 * streams. Never accept a changed public format, size or count. */
++		if (config->size() != streamConfigs.size())
++			return -EINVAL;
++		for (unsigned int i = 0; i < config->size(); ++i) {
++			const StreamConfiguration &cfg = (*config)[i];
++			const StreamConfiguration &requested = streamConfigs[i].config;
+ 			LOG(HAL, Info) << " - " << cfg.toString();
+-
+-		return -EINVAL;
++			if (cfg.size != requested.size ||
++			    cfg.pixelFormat != requested.pixelFormat)
++				return -EINVAL;
++		}
++		break;
+ 	case CameraConfiguration::Invalid:
+ 		LOG(HAL, Info) << "Camera configuration invalid";
+ 		return -EINVAL;

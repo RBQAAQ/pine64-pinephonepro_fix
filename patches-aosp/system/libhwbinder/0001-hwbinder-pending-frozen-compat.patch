@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenCode <noreply@opencode.local>
+Date: Sat, 10 Oct 2026 06:00:00 +0800
+Subject: [PATCH] hwbinder: accept pending-frozen oneway acknowledgements
+
+diff --git a/IPCThreadState.cpp b/IPCThreadState.cpp
+index aa050fc..b1405bc 100644
+--- a/IPCThreadState.cpp
++++ b/IPCThreadState.cpp
+@@ -67,6 +67,10 @@
+ namespace android {
+ namespace hardware {
+ 
++// A queued oneway transaction is complete from the sender's perspective,
++// even when its receiver is frozen. Keep compatibility with older UAPI headers.
++static constexpr uint32_t kTransactionPendingFrozen = _IO('r', 20);
++
+ // Static const and functions will be optimized out if not used,
+ // when LOG_NDEBUG and references in IF_LOG_COMMANDS() are optimized out.
+ static const char *kReturnStrings[] = {
+@@ -115,6 +119,7 @@ static const char *kCommandStrings[] = {
+ 
+ static const char* getReturnString(uint32_t cmd)
+ {
++    if (cmd == kTransactionPendingFrozen) return "BR_TRANSACTION_PENDING_FROZEN";
+     size_t idx = cmd & _IOC_NRMASK;
+     if (idx < sizeof(kReturnStrings) / sizeof(kReturnStrings[0]))
+         return kReturnStrings[idx];
+@@ -809,6 +814,7 @@ status_t IPCThreadState::waitForResponse(Parcel *reply, status_t *acquireResult)
+             CallStack::logStack("oneway spamming", CallStack::getCurrent().get(),
+                     ANDROID_LOG_ERROR);
+             [[fallthrough]];
++        case kTransactionPendingFrozen:
+         case BR_TRANSACTION_COMPLETE:
+             if (!reply && !acquireResult) goto finish;
+             break;
+@@ -1263,6 +1269,7 @@ status_t IPCThreadState::executeCommand(int32_t cmd)
+         result = TIMED_OUT;
+         break;
+ 
++    case kTransactionPendingFrozen:
+     case BR_NOOP:
+         break;
+ 
+
+-- 
+2.51.0

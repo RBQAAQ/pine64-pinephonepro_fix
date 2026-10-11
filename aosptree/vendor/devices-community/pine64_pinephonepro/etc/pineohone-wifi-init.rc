@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+service pineohone-wifi-init /vendor/bin/sh /vendor/bin/pineohone-wifi-init.sh
+    class core
+    user root
+    group root wifi inet
+    capabilities SYS_MODULE SYS_ADMIN NET_ADMIN
+    disabled
+    oneshot
+
+on post-fs-data
+    exec_start pineohone-wifi-init

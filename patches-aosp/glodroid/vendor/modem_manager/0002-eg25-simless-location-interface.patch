@@ -1,0 +1,89 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenCode <noreply@opencode.local>
+Date: Sun, 11 Oct 2026 22:30:00 +0800
+Subject: [PATCH] eg25 simless location interface
+
+Built and verified on the PinePhone Pro. See docs/VERIFIED_REPAIRS.md
+for the exact validation scope and remaining limitations.
+
+---
+diff --git a/src/mm-broadband-modem.c b/src/mm-broadband-modem.c
+index 7f2fe83..041f1f0 100644
+--- a/src/mm-broadband-modem.c
++++ b/src/mm-broadband-modem.c
+@@ -12340,6 +12340,7 @@ typedef enum {
+     INITIALIZE_STEP_IFACE_OMA,
+     INITIALIZE_STEP_IFACE_SAR,
+     INITIALIZE_STEP_FALLBACK_LIMITED,
++    INITIALIZE_STEP_IFACE_STANDALONE_LOCATION,
+     INITIALIZE_STEP_IFACE_VOICE,
+     INITIALIZE_STEP_IFACE_FIRMWARE,
+     INITIALIZE_STEP_IFACE_SIMPLE,
+@@ -12526,6 +12527,39 @@ INTERFACE_INIT_READY_FN (iface_modem_oma,                  MM_IFACE_MODEM_OMA,
+ INTERFACE_INIT_READY_FN (iface_modem_firmware,             MM_IFACE_MODEM_FIRMWARE,             FALSE)
+ INTERFACE_INIT_READY_FN (iface_modem_sar,                  MM_IFACE_MODEM_SAR,                  FALSE)
+ 
++/* Only preserve independently probed EG25 GNSS for a missing SIM, never for
++ * an unrelated firmware/modem failure. The cellular interface stays failed. */
++static gboolean
++eg25_simless_location_available (MMBroadbandModem *self)
++{
++    return mm_base_modem_get_vendor_id (MM_BASE_MODEM (self)) == 0x2c7c &&
++           mm_base_modem_get_product_id (MM_BASE_MODEM (self)) == 0x0125 &&
++           self->priv->modem_state == MM_MODEM_STATE_FAILED &&
++           self->priv->modem_dbus_skeleton &&
++           mm_gdbus_modem_get_state_failed_reason (self->priv->modem_dbus_skeleton) ==
++               MM_MODEM_STATE_FAILED_REASON_SIM_MISSING &&
++           mm_base_modem_peek_port_gps (MM_BASE_MODEM (self));
++}
++
++static void
++iface_standalone_location_initialize_ready (MMBroadbandModem *self,
++                                          GAsyncResult *result,
++                                          GTask *task)
++{
++    InitializeContext *ctx = g_task_get_task_data (task);
++    GError *error = NULL;
++
++    if (!mm_iface_modem_location_initialize_finish (MM_IFACE_MODEM_LOCATION (self), result, &error)) {
++        mm_obj_warn (self, "couldn't initialize standalone GNSS: %s", error->message);
++        mm_iface_modem_location_shutdown (MM_IFACE_MODEM_LOCATION (self));
++        g_error_free (error);
++    } else {
++        mm_iface_modem_location_bind_simple_status (MM_IFACE_MODEM_LOCATION (self), self->priv->modem_simple_status);
++    }
++    ctx->step++;
++    initialize_step (task);
++}
++
+ static void
+ initialize_step (GTask *task)
+ {
+@@ -12690,6 +12724,17 @@ initialize_step (GTask *task)
+         ctx->step++;
+        /* fall through */
+ 
++    case INITIALIZE_STEP_IFACE_STANDALONE_LOCATION:
++        if (eg25_simless_location_available (ctx->self)) {
++            mm_iface_modem_location_initialize (MM_IFACE_MODEM_LOCATION (ctx->self),
++                                                g_task_get_cancellable (task),
++                                                (GAsyncReadyCallback)iface_standalone_location_initialize_ready,
++                                                task);
++            return;
++        }
++        ctx->step++;
++       /* fall through */
++
+     case INITIALIZE_STEP_IFACE_VOICE:
+         /* Initialize the Voice interface */
+         mm_iface_modem_voice_initialize (MM_IFACE_MODEM_VOICE (ctx->self),
+@@ -12740,7 +12785,8 @@ initialize_step (GTask *task)
+                 mm_iface_modem_3gpp_profile_manager_shutdown (MM_IFACE_MODEM_3GPP_PROFILE_MANAGER (ctx->self));
+                 mm_iface_modem_3gpp_ussd_shutdown (MM_IFACE_MODEM_3GPP_USSD (ctx->self));
+                 mm_iface_modem_cdma_shutdown (MM_IFACE_MODEM_CDMA (ctx->self));
+-                mm_iface_modem_location_shutdown (MM_IFACE_MODEM_LOCATION (ctx->self));
++                if (!eg25_simless_location_available (ctx->self))
++                    mm_iface_modem_location_shutdown (MM_IFACE_MODEM_LOCATION (ctx->self));
+                 mm_iface_modem_signal_shutdown (MM_IFACE_MODEM_SIGNAL (ctx->self));
+                 mm_iface_modem_messaging_shutdown (MM_IFACE_MODEM_MESSAGING (ctx->self));
+                 mm_iface_modem_time_shutdown (MM_IFACE_MODEM_TIME (ctx->self));

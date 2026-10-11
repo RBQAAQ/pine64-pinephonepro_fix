@@ -1,0 +1,5 @@
+service vendor.gnss-pinephonepro /vendor/bin/hw/android.hardware.gnss@1.0-service.pinephonepro
+    class hal
+    user root
+    group root gps radio inet
+    interface android.hardware.gnss@1.0::IGnss default

@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenCode <noreply@opencode.local>
+Date: Sat, 10 Oct 2026 06:00:00 +0800
+Subject: [PATCH] arm64: dts: pinephone-pro: describe front and rear camera orientation
+
+--- a/arch/arm64/boot/dts/rockchip/rk3399-pinephone-pro.dts
++++ b/arch/arm64/boot/dts/rockchip/rk3399-pinephone-pro.dts
+@@ -884,6 +884,7 @@
+ 		powerdown-gpios = <&gpio2 RK_PD4 GPIO_ACTIVE_HIGH>;
+ 
+ 		rotation = <270>;
++		orientation = <1>;
+ 
+ 		lens-focus = <&wcam_lens>;
+ 		flash-leds = <&sgm3140_flash>;
+@@ -924,6 +925,7 @@
+ 		rockchip,camera-module-lens-name = "Largan-9569A2";
+ 
+ 		rotation = <90>;
++		orientation = <0>;
+ 
+ 		port {
+ 			ucam_out: endpoint {
+
+-- 
+2.51.0

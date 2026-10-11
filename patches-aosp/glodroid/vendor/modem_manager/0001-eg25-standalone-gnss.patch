@@ -1,0 +1,96 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenCode <noreply@opencode.local>
+Date: Sat, 10 Oct 2026 06:00:00 +0800
+Subject: [PATCH] location: allow authorized standalone GNSS on EG25 without cellular enable
+
+diff --git a/cli/mmcli-modem-location.c b/cli/mmcli-modem-location.c
+index 936ff42..bb61f91 100644
+--- a/cli/mmcli-modem-location.c
++++ b/cli/mmcli-modem-location.c
+@@ -254,11 +254,8 @@ context_free (void)
+ static void
+ ensure_modem_location (void)
+ {
+-    if (mm_modem_get_state (mm_object_peek_modem (ctx->object)) < MM_MODEM_STATE_ENABLED) {
+-        g_printerr ("error: modem not enabled yet\n");
+-        exit (EXIT_FAILURE);
+-    }
+-
++    /* Let the daemon enforce state/capability/authorization rules. Some modems
++     * can provide standalone GNSS while the cellular interface is disabled. */
+     if (!ctx->modem_location) {
+         g_printerr ("error: modem has no location capabilities\n");
+         exit (EXIT_FAILURE);
+diff --git a/src/mm-iface-modem-location.c b/src/mm-iface-modem-location.c
+index da16a6d..e438d88 100644
+--- a/src/mm-iface-modem-location.c
++++ b/src/mm-iface-modem-location.c
+@@ -30,6 +30,19 @@
+ 
+ static GQuark location_context_quark;
+ 
++/* EG25 standalone GNSS is independent of SIM/network registration. Keep the
++ * normal authorization and capability checks, and do not relax cellular/SUPL
++ * operations for disabled modems. */
++static gboolean
++eg25_standalone_gps_available (MMBaseModem *self,
++                              MmGdbusModemLocation *skeleton)
++{
++    return mm_base_modem_get_vendor_id (self) == 0x2c7c &&
++           mm_base_modem_get_product_id (self) == 0x0125 &&
++           (mm_gdbus_modem_location_get_capabilities (skeleton) &
++            (MM_MODEM_LOCATION_SOURCE_GPS_NMEA | MM_MODEM_LOCATION_SOURCE_GPS_RAW));
++}
++
+ /*****************************************************************************/
+ 
+ void
+@@ -941,7 +954,11 @@ handle_setup_auth_ready (MMBaseModem *self,
+     g_object_get (self,
+                   MM_IFACE_MODEM_STATE, &modem_state,
+                   NULL);
+-    if (modem_state < MM_MODEM_STATE_ENABLED) {
++    if (modem_state < MM_MODEM_STATE_ENABLED &&
++        !(eg25_standalone_gps_available (self, ctx->skeleton) &&
++          !(ctx->sources & ~(MM_MODEM_LOCATION_SOURCE_GPS_NMEA |
++                              MM_MODEM_LOCATION_SOURCE_GPS_RAW |
++                              MM_MODEM_LOCATION_SOURCE_GPS_UNMANAGED)))) {
+         g_dbus_method_invocation_return_error (ctx->invocation,
+                                                MM_CORE_ERROR,
+                                                MM_CORE_ERROR_WRONG_STATE,
+@@ -1280,7 +1297,8 @@ handle_set_gps_refresh_rate_auth_ready (MMBaseModem *self,
+     g_object_get (self,
+                   MM_IFACE_MODEM_STATE, &modem_state,
+                   NULL);
+-    if (modem_state < MM_MODEM_STATE_ENABLED) {
++    if (modem_state < MM_MODEM_STATE_ENABLED &&
++        !eg25_standalone_gps_available (self, ctx->skeleton)) {
+         g_dbus_method_invocation_return_error (ctx->invocation,
+                                                MM_CORE_ERROR,
+                                                MM_CORE_ERROR_WRONG_STATE,
+@@ -1365,7 +1383,8 @@ handle_get_location_auth_ready (MMBaseModem *self,
+     g_object_get (self,
+                   MM_IFACE_MODEM_STATE, &modem_state,
+                   NULL);
+-    if (modem_state < MM_MODEM_STATE_ENABLED) {
++    if (modem_state < MM_MODEM_STATE_ENABLED &&
++        !eg25_standalone_gps_available (self, ctx->skeleton)) {
+         g_dbus_method_invocation_return_error (ctx->invocation,
+                                                MM_CORE_ERROR,
+                                                MM_CORE_ERROR_WRONG_STATE,
+@@ -1380,10 +1399,10 @@ handle_get_location_auth_ready (MMBaseModem *self,
+         ctx->skeleton,
+         ctx->invocation,
+         build_location_dictionary (NULL,
+-                                   location_ctx->location_3gpp,
++                                   modem_state >= MM_MODEM_STATE_ENABLED ? location_ctx->location_3gpp : NULL,
+                                    location_ctx->location_gps_nmea,
+                                    location_ctx->location_gps_raw,
+-                                   location_ctx->location_cdma_bs));
++                                   modem_state >= MM_MODEM_STATE_ENABLED ? location_ctx->location_cdma_bs : NULL));
+     handle_get_location_context_free (ctx);
+ }
+ 
+
+-- 
+2.51.0

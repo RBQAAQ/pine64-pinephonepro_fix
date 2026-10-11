@@ -1,0 +1,21 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenCode <noreply@opencode.local>
+Date: Sun, 11 Oct 2026 22:30:00 +0800
+Subject: [PATCH] arm64: dts: select the PinePhone Pro IMX258 PDAF variant
+
+Built and verified on the PinePhone Pro. See docs/VERIFIED_REPAIRS.md
+for the exact validation scope and remaining limitations.
+
+---
+diff --git a/arch/arm64/boot/dts/rockchip/rk3399-pinephone-pro.dts b/arch/arm64/boot/dts/rockchip/rk3399-pinephone-pro.dts
+--- a/arch/arm64/boot/dts/rockchip/rk3399-pinephone-pro.dts
++++ b/arch/arm64/boot/dts/rockchip/rk3399-pinephone-pro.dts
+@@ -868,7 +868,7 @@
+ 	assigned-clock-rates = <19200000 0>;
+ 
+ 	wcam: camera@1a {
+-		compatible = "sony,imx258";
++		compatible = "sony,imx258-pdaf";
+ 		reg = <0x1a>;
+ 		pinctrl-names = "default";
+ 		pinctrl-0 = <&wcam_rst &wcam_pdn>;

@@ -1,0 +1,19 @@
+cc_library_shared {
+    name: "gps.pine64_pinephonepro",
+    vendor: true,
+    relative_install_path: "hw",
+    srcs: ["gps.cpp"],
+    header_libs: ["libhardware_headers"],
+    shared_libs: ["liblog", "libhardware"],
+    cflags: ["-Wall", "-Wextra"],
+}
+
+cc_binary {
+    name: "android.hardware.gnss@1.0-service.pinephonepro",
+    vendor: true,
+    relative_install_path: "hw",
+    srcs: ["service.cpp"],
+    init_rc: ["gnss-service.rc"],
+    vintf_fragments: ["gnss-service.xml"],
+    shared_libs: ["liblog", "libutils", "libhidlbase", "android.hardware.gnss@1.0"],
+}

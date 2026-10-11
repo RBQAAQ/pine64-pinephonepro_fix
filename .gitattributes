@@ -1,0 +1,2 @@
+# Patch context includes intentional single-space blank lines.
+*.patch -whitespace

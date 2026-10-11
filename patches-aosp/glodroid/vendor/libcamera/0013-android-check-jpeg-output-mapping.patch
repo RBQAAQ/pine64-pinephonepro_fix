@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenCode <noreply@opencode.local>
+Date: Sun, 11 Oct 2026 22:30:00 +0800
+Subject: [PATCH] android check jpeg output mapping
+
+Built and verified on the PinePhone Pro. See docs/VERIFIED_REPAIRS.md
+for the exact validation scope and remaining limitations.
+
+---
+diff --git a/src/android/jpeg/post_processor_jpeg.cpp b/src/android/jpeg/post_processor_jpeg.cpp
+index 4026165..67f08db 100644
+--- a/src/android/jpeg/post_processor_jpeg.cpp
++++ b/src/android/jpeg/post_processor_jpeg.cpp
+@@ -115,6 +115,16 @@ void PostProcessorJpeg::process(Camera3RequestDescriptor::StreamBuffer *streamBu
+ 
+ 	ASSERT(destination->numPlanes() == 1);
+ 
++	auto destinationPlane = destination->plane(0);
++	const size_t blobSize = destination->jpegBufferSize(cameraDevice_->maxJpegBufferSize());
++	if (!destinationPlane.data() || blobSize < sizeof(struct camera3_jpeg_blob) ||
++	    destinationPlane.size() < blobSize) {
++		LOG(JPEG, Error) << "Invalid JPEG buffer mapping: planes=" << destination->numPlanes()
++				<< " plane size=" << destinationPlane.size() << " blob size=" << blobSize;
++		processComplete.emit(streamBuffer, PostProcessor::Status::Error);
++		return;
++	}
++
+ 	const CameraMetadata &requestMetadata = streamBuffer->request->settings_;
+ 	CameraMetadata *resultMetadata = streamBuffer->request->resultMetadata_.get();
+ 	camera_metadata_ro_entry_t entry;

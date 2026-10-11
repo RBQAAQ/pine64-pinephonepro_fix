@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenCode <noreply@opencode.local>
+Date: Sun, 11 Oct 2026 22:30:00 +0800
+Subject: [PATCH] use androidx color picker dialogs
+
+Built and verified on the PinePhone Pro. See docs/VERIFIED_REPAIRS.md
+for the exact validation scope and remaining limitations.
+
+---
+diff --git a/app/src/main/java/com/android/calendar/CalendarColorPickerDialog.java b/app/src/main/java/com/android/calendar/CalendarColorPickerDialog.java
+--- a/app/src/main/java/com/android/calendar/CalendarColorPickerDialog.java
++++ b/app/src/main/java/com/android/calendar/CalendarColorPickerDialog.java
+@@ -30,3 +30,3 @@
+ 
+-import com.android.colorpicker.ColorPickerDialog;
++import com.android.calendar.settings.ColorPickerDialogX;
+ import com.android.colorpicker.ColorPickerSwatch.OnColorSelectedListener;
+@@ -39,3 +39,3 @@
+ 
+-public class CalendarColorPickerDialog extends ColorPickerDialog {
++public class CalendarColorPickerDialog extends ColorPickerDialogX {
+ 
+diff --git a/app/src/main/java/com/android/calendar/event/EventColorPickerDialog.java b/app/src/main/java/com/android/calendar/event/EventColorPickerDialog.java
+--- a/app/src/main/java/com/android/calendar/event/EventColorPickerDialog.java
++++ b/app/src/main/java/com/android/calendar/event/EventColorPickerDialog.java
+@@ -22,3 +22,3 @@
+ 
+-import com.android.colorpicker.ColorPickerDialog;
++import com.android.calendar.settings.ColorPickerDialogX;
+ 
+@@ -29,3 +29,3 @@
+  */
+-public class EventColorPickerDialog extends ColorPickerDialog {
++public class EventColorPickerDialog extends ColorPickerDialogX {
+ 

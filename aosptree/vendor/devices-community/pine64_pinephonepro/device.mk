@@ -14,6 +14,11 @@ PRODUCT_COPY_FILES += \
     $(LOCAL_PATH)/firmware/brcmfmac43455-sdio.clm_blob:$(TARGET_COPY_OUT_VENDOR)/etc/firmware/brcm/brcmfmac43455-sdio.clm_blob \
     $(LOCAL_PATH)/firmware/BCM4345C0.hcd:$(TARGET_COPY_OUT_VENDOR)/etc/firmware/brcm/BCM4345C0.hcd \
 
+# Broadcom firmware-vendor module recovery (bounded, one-shot).
+PRODUCT_COPY_FILES += \
+    $(LOCAL_PATH)/etc/pineohone-wifi-init.sh:$(TARGET_COPY_OUT_VENDOR)/bin/pineohone-wifi-init.sh \
+    $(LOCAL_PATH)/etc/pineohone-wifi-init.rc:$(TARGET_COPY_OUT_VENDOR)/etc/init/pineohone-wifi-init.rc
+
 # Checked by android.opengl.cts.OpenGlEsVersionTest#testOpenGlEsVersion. Required to run correct set of dEQP tests.
 # 196609 == 0x00030001 == GLES v3.1
 PRODUCT_VENDOR_PROPERTIES += \
@@ -28,6 +33,14 @@ PRODUCT_PACKAGES += \
     sensors.iio \
     android.hardware.sensors@1.0-impl:64 \
     android.hardware.sensors@1.0-service \
+
+# GNSS: standard HIDL bridge backed by the modem's real NMEA source.
+PRODUCT_PACKAGES += \
+    gps.pine64_pinephonepro \
+    android.hardware.gnss@1.0-impl \
+    android.hardware.gnss@1.0-service.pinephonepro
+
+PRODUCT_VENDOR_PROPERTIES += ro.hardware.gps=pine64_pinephonepro
 
 PRODUCT_PROPERTY_OVERRIDES += \
     ro.hardware.sensors=iio                            \
